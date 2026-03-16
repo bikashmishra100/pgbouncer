@@ -36,6 +36,9 @@ typedef struct PgServerPreparedStatement {
 
 
 bool handle_parse_command(PgSocket *client, PktHdr *pkt);
+bool handle_parse_command_stripped(PgSocket *client, const char *client_stmt_name,
+				   const uint8_t *query_and_parameters, size_t query_and_parameters_len);
+bool client_has_prepared_statement(PgSocket *client, const char *name);
 bool handle_bind_command(PgSocket *client, PktHdr *pkt);
 bool handle_describe_command(PgSocket *client, PktHdr *pkt);
 bool handle_close_statement_command(PgSocket *client, PktHdr *pkt, PgClosePacket *close_packet);

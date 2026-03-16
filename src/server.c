@@ -379,9 +379,10 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		if (!mbuf_get_char(&pkt->data, &state))
 			return false;
 
-		if (!pop_outstanding_request(server, (char[]) {PqMsg_Sync, PqMsg_Query, PqMsg_FunctionCall, '\0'}, &ignore_packet)
-		    && server->query_failed) {
-			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_Sync, '\0'}))
+		if (!pop_outstanding_request(server, (char[]) {PqMsg_Sync, PqMsg_Query, PqMsg_FunctionCall, '\0'}, &ignore_packet)) {
+			/* Extended protocol has Parse first; clear full round-trip up to Sync/Query/FunctionCall.
+			 * Do not unregister Parse entries: the round-trip succeeded, server still has them. */
+			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_Sync, PqMsg_Query, PqMsg_FunctionCall, '\0'}, false))
 				return false;
 		}
 		server->query_failed = false;
@@ -412,7 +413,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 	 * dying backend.  It is better to tag server as dirty and drop
 	 * it later.
 	 */
-	case PqMsg_ErrorResponse:
+		case PqMsg_ErrorResponse:
 		if (server->setting_vars) {
 			/*
 			 * the SET and user query will be different TX
@@ -427,6 +428,24 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			 */
 			disconnect_server(server, true, "invalid server parameter");
 			return false;
+		}
+
+		/* 42P05 = duplicate_prepared_statement: we cleared cache on link and sent Parse
+		 * but server still had the statement; treat as success and send ParseComplete. */
+		if (client && is_prepared_statements_enabled(server)) {
+			const char *level, *msg, *sqlstate;
+			struct List *first_item = statlist_first(&server->outstanding_requests);
+			parse_server_error(pkt, &level, &msg, &sqlstate);
+			if (sqlstate && strcmp(sqlstate, "42P05") == 0 && first_item) {
+				OutstandingRequest *req = container_of(first_item, OutstandingRequest, node);
+				if (req->type == PqMsg_Parse) {
+					pop_outstanding_request(server, (char[]) {PqMsg_Parse, '\0'}, &ignore_packet);
+					if (!queue_fake_response(client, PqMsg_Parse))
+						return false;
+					sbuf_prepare_skip(sbuf, pkt->len);
+					return true;
+				}
+			}
 		}
 
 		/* ErrorResponse and CommandComplete show end of copy mode */
@@ -453,7 +472,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			 * COPY for some reason unknown to the client (e.g. a
 			 * unique constraint violation).
 			 */
-			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_CopyDone, PqMsg_CopyFail, '\0'}))
+			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_CopyDone, PqMsg_CopyFail, '\0'}, true))
 				return false;
 		}
 
@@ -472,7 +491,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			 * outstanding requests queue, for which we don't
 			 * expect a response from the server.
 			 */
-			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_CopyDone, '\0'}))
+			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_CopyDone, '\0'}, true))
 				return false;
 		}
 		/*

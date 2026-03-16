@@ -891,8 +891,8 @@ bool check_fast_fail(PgSocket *client)
 	return false;
 }
 
-/* link if found, otherwise put into wait queue */
-bool find_server(PgSocket *client)
+/* link if found, otherwise put into wait queue (or return false if !allow_pause) */
+bool find_server(PgSocket *client, bool allow_pause)
 {
 	PgPool *pool = client->pool;
 	PgSocket *server;
@@ -961,6 +961,18 @@ bool find_server(PgSocket *client)
 	/* link or send to waiters list */
 	if (server) {
 		slog_noise(client, "linking client to S-%p", server);
+		/* In transaction/statement pooling we cannot trust server prepared statement
+		 * cache from a previous user of this connection; clear so we always send
+		 * Parse before Bind (avoids "does not exist"). "Already exists" is handled
+		 * in server ErrorResponse. */
+		if (connection_pool_mode(server) != POOL_SESSION && is_prepared_statements_enabled(server))
+			free_server_prepared_statements(server);
+		/* Count every server assignment so the stat reflects activity (short-lived connections often have only one assign).
+		 * When handling SET pgbouncer.database we count once in db_switch_after_switch instead. */
+		if (!client->in_set_pgbouncer_database)
+			server->pool->stats.connection_switch_count++;
+		client->pool_switched = false;
+		client->last_linked_server = server;
 		client->link = server;
 		server->link = client;
 		server->pool->stats.server_assignment_count++;
@@ -976,7 +988,8 @@ bool find_server(PgSocket *client)
 			res = true;
 		}
 	} else {
-		pause_client(client);
+		if (allow_pause)
+			pause_client(client);
 		res = false;
 	}
 	return res;
@@ -1123,16 +1136,18 @@ bool pop_outstanding_request(PgSocket *server, const char types[], bool *skip)
 
 /*
  * Clear all outstanding requests until we reach response of any of the message
- * types in "types". Any Parse or Close statement requests that were still
- * outstanding will be unregistered or re-registered from the server its cache.
+ * types in "types". If unregister_parses is true, Parse requests are
+ * unregistered from the server cache (for error paths). If false, Parse
+ * entries are left in the cache (successful round-trip, e.g. extended
+ * protocol). Close requests are re-registered when cleared.
  */
-bool clear_outstanding_requests_until(PgSocket *server, const char types[])
+bool clear_outstanding_requests_until(PgSocket *server, const char types[], bool unregister_parses)
 {
 	struct List *item, *tmp;
 	statlist_for_each_safe(item, &server->outstanding_requests, tmp) {
 		OutstandingRequest *request = container_of(item, OutstandingRequest, node);
 		char type = request->type;
-		if (type == PqMsg_Parse && request->server_ps_query_id > 0) {
+		if (type == PqMsg_Parse && unregister_parses && request->server_ps_query_id > 0) {
 			unregister_prepared_statement(server, request->server_ps_query_id);
 			slog_noise(server,
 				   "failed prepared statement '" PREPARED_STMT_NAME_FORMAT "' removed from server cache, %d cached items",
@@ -1169,8 +1184,13 @@ static bool reset_on_release(PgSocket *server)
 
 	slog_debug(server, "resetting: %s", cf_server_reset_query);
 	SEND_generic(res, server, PqMsg_Query, "s", cf_server_reset_query);
-	if (!res)
+	if (!res) {
 		disconnect_server(server, false, "reset query failed");
+		return res;
+	}
+	/* Reset query (e.g. DISCARD ALL) clears server prepared statements; keep cache in sync. */
+	if (is_prepared_statements_enabled(server))
+		free_server_prepared_statements(server);
 	return res;
 }
 
@@ -1214,6 +1234,7 @@ bool release_server(PgSocket *server)
 	case SV_BEING_CANCELED:
 	case SV_ACTIVE:
 		if (server->link) {
+			server->link->last_linked_server = server;
 			server->link->link = NULL;
 			server->link = NULL;
 		}

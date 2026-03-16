@@ -1,0 +1,23 @@
+# Copyright Broadcom, Inc. All Rights Reserved.
+# SPDX-License-Identifier: APACHE-2.0
+
+services:
+  postgresql:
+    image: docker.io/bitnami/postgresql:latest
+    volumes:
+      - 'postgresql_data:/bitnami/postgresql'
+    environment:
+      - 'ALLOW_EMPTY_PASSWORD=yes'
+
+  pgbouncer:
+    build:
+      context: ..
+      dockerfile: debian-12/Dockerfile
+    ports:
+      - 6432:6432
+    environment:
+      - POSTGRESQL_HOST=postgresql
+      - PGBOUNCER_AUTH_TYPE=trust
+volumes:
+  postgresql_data:
+    driver: local

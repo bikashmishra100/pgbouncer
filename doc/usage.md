@@ -189,6 +189,13 @@ total_query_count
 total_server_assignment_count
 :   Total times a server was assigned to a client
 
+total_connection_switch_count
+:   Total number of server assignments (connection switches): incremented
+    every time a client is linked to a server.  With short-lived
+    connections (one query per connection) this matches the number of
+    queries; with long-lived connections it also counts re-assignments
+    (e.g. transaction pooling).
+
 total_received
 :   Total volume in bytes of network traffic received by **pgbouncer**.
 
@@ -230,6 +237,9 @@ avg_query_count
 avg_server_assignment_count
 :   Average number of times a server as assigned to a client per second in the
     last stat period.
+
+avg_connection_switch_count
+:   Average number of connection switches per second in the last stat period.
 
 avg_recv
 :   Average received (from clients) bytes per second.
@@ -898,6 +908,28 @@ Changes a configuration setting (see also **SHOW CONFIG**).  For example:
 (Note that this command is run on the PgBouncer admin console and sets
 PgBouncer settings.  A **SET** command run on another database will be
 passed to the PostgreSQL backend like any other SQL command.)
+
+#### SET pgbouncer.database (database switching)
+
+A query that sets **pgbouncer.database** switches the client's pool to that
+database for the connection.  Use standard PostgreSQL **SET** syntax, for example:
+
+    SET pgbouncer.database = 'otherdb';
+    SET pgbouncer.database = 'otherdb'; SELECT 1;
+    SET pgbouncer.database = 'db1'; INSERT INTO table VALUES (...);
+
+When the query contains only the **SET** (with optional trailing semicolon),
+the backend receives an empty query (no statement).  When the query contains
+one or more statements after the **SET** (after a semicolon), the **SET** is
+stripped and only the following part is forwarded to the server.  That allows
+prepared statements (extended protocol) to be used with mid-connection
+database switching, since the backend receives a single statement.
+
+The value may be a single-quoted string, double-quoted identifier, or
+unquoted identifier.  **SET SESSION** and **SET LOCAL** are accepted.
+Comments before the statement are allowed.  **SET pgbouncer.database** is
+not allowed when a transaction is in progress; the server returns an error
+in that case.
 
 ### Signals
 

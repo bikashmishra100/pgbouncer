@@ -408,6 +408,110 @@ oom:
 }
 
 /*
+ * Same as handle_parse_command but for a Parse whose query was stripped
+ * (e.g. SET pgbouncer.database removed). Registers client_stmt_name -> canonical
+ * server statement (by stripped query) so Bind/Describe/Close work after DB switch.
+ */
+bool handle_parse_command_stripped(PgSocket *client, const char *client_stmt_name,
+				   const uint8_t *query_and_parameters, size_t query_and_parameters_len)
+{
+	PgSocket *server = client->link;
+	PgParsePacket pp;
+	PgServerPreparedStatement *server_ps = NULL;
+	PgClientPreparedStatement *client_ps = NULL;
+	PgPreparedStatement *ps;
+	PktBuf *buf;
+	bool found = false;
+
+	Assert(server);
+
+	/*
+	 * We are in "just switched database" context. Do not trust the server's
+	 * prepared statement cache (e.g. from a previous user or retry); clear it
+	 * so we always send Parse and avoid "prepared statement does not exist".
+	 */
+	if (connection_pool_mode(server) != POOL_SESSION && is_prepared_statements_enabled(server))
+		free_server_prepared_statements(server);
+
+	HASH_FIND_STR(client->client_prepared_statements, client_stmt_name, client_ps);
+	if (client_ps) {
+		/* Re-Parse with same name (e.g. after SET pgbouncer.database switch). Allow if same query. */
+		ps = client_ps->ps;
+		if (ps->query_and_parameters_len == query_and_parameters_len &&
+		    memcmp(ps->query_and_parameters, query_and_parameters, query_and_parameters_len) == 0) {
+			HASH_FIND_UINT64(server->server_prepared_statements, &ps->query_id, server_ps);
+			/* After DB switch always send Parse to backend; never skip with RA_FAKE. */
+			buf = pktbuf_temp();
+			pktbuf_write_Parse(buf, ps->stmt_name, ps->query_and_parameters, ps->query_and_parameters_len);
+			if (!sbuf_queue_packet(&client->sbuf, &server->sbuf, buf))
+				return false;
+			client->pool->stats.ps_server_parse_count++;
+			if (!add_outstanding_request(client, PqMsg_Parse, RA_FORWARD))
+				return false;
+			if (!server_ps) {
+				server_ps = create_server_prepared_statement(ps);
+				if (!server_ps)
+					return false;
+				if (!register_prepared_statement(client, server, server_ps))
+					return false;
+			}
+			return true;
+		}
+		slog_error(client, "prepared statement '%s' was already prepared", client_stmt_name);
+		disconnect_client(client, true, "prepared statement name is already in use");
+		return false;
+	}
+
+	client->pool->stats.ps_client_parse_count++;
+
+	pp.name = client_stmt_name;
+	pp.query_and_parameters = (const char *)query_and_parameters;
+	pp.query_and_parameters_len = query_and_parameters_len;
+
+	ps = get_prepared_statement(&pp, &found);
+	if (ps == NULL)
+		goto oom;
+
+	client_ps = create_client_prepared_statement(pp.name, ps);
+	if (client_ps == NULL)
+		goto oom;
+	HASH_ADD_STR(client->client_prepared_statements, stmt_name, client_ps);
+	if (uthash_alloc_failed) {
+		uthash_alloc_failed = false;
+		goto oom;
+	}
+
+	/* After DB switch always send Parse to backend; never skip with RA_FAKE. */
+	slog_debug(client, "handle_parse_command_stripped: creating mapping for statement '%s' to '%s' (query '%s')",
+		   client_ps->stmt_name, ps->stmt_name, ps->query_and_parameters);
+
+	buf = pktbuf_temp();
+	pktbuf_write_Parse(buf, ps->stmt_name, ps->query_and_parameters, ps->query_and_parameters_len);
+	if (!sbuf_queue_packet(&client->sbuf, &server->sbuf, buf))
+		goto oom;
+
+	client->pool->stats.ps_server_parse_count++;
+
+	if (!add_outstanding_request(client, PqMsg_Parse, RA_FORWARD))
+		goto oom;
+
+	server_ps = create_server_prepared_statement(ps);
+	if (!server_ps)
+		goto oom;
+	if (!register_prepared_statement(client, server, server_ps))
+		goto oom;
+
+	return true;
+
+oom:
+	free(client_ps);
+	free_server_prepared_statement(server_ps);
+	disconnect_client(client, true, "out of memory");
+	disconnect_server(client->link, true, "out of memory");
+	return false;
+}
+
+/*
  * Get the given prepared statement from the client hash map. This returns NULL
  * and closes the client connection if no prepared statement with this name
  * could not be found.
@@ -431,6 +535,13 @@ static PgClientPreparedStatement *get_client_prepared_statement(PgSocket *client
 		disconnect_client(client, true, "prepared statement did not exist");
 	}
 	return client_ps;
+}
+
+bool client_has_prepared_statement(PgSocket *client, const char *name)
+{
+	PgClientPreparedStatement *client_ps = NULL;
+	HASH_FIND_STR(client->client_prepared_statements, name, client_ps);
+	return client_ps != NULL;
 }
 
 /*
@@ -512,10 +623,10 @@ bool handle_bind_command(PgSocket *client, PktHdr *pkt)
 	PktBuf *buf;
 	int diff;
 
-	Assert(server);
-
 	if (!unmarshall_bind_packet(client, pkt, &bp))
 		return false;
+
+	Assert(server);
 
 	/* update stats */
 	client->pool->stats.ps_bind_count++;
