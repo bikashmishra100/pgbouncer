@@ -127,9 +127,6 @@ void pktbuf_write_ExtQuery(PktBuf *buf, const char *query, int nargs, ...);
 #define pktbuf_write_ParseComplete(buf) \
 	pktbuf_write_generic(buf, PqMsg_ParseComplete, "")
 
-#define pktbuf_write_BindComplete(buf) \
-	pktbuf_write_generic(buf, PqMsg_BindComplete, "")
-
 #define pktbuf_write_DescribeStmt(buf, stmt) \
 	pktbuf_write_generic(buf, PqMsg_Describe, "cs", 'S', stmt)
 
@@ -138,9 +135,6 @@ void pktbuf_write_ExtQuery(PktBuf *buf, const char *query, int nargs, ...);
 
 #define pktbuf_write_CloseComplete(buf) \
 	pktbuf_write_generic(buf, PqMsg_CloseComplete, "")
-
-#define pktbuf_write_NoData(buf) \
-	pktbuf_write_generic(buf, PqMsg_NoData, "")
 
 /*
  * Shortcut for creating DataRow in memory.

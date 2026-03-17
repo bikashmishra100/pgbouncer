@@ -231,13 +231,10 @@ void sbuf_continue(SBuf *sbuf)
 {
 	bool do_recv = DO_RECV;
 	bool res;
-	PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
 	AssertActive(sbuf);
 
-	slog_debug(sk, "sbuf_continue: entry sock=%d do_recv=%d (stall trace)", sbuf->sock, do_recv);
 	res = sbuf_wait_for_data(sbuf);
 	if (!res) {
-		slog_debug(sk, "sbuf_continue: sbuf_wait_for_data failed (stall trace)");
 		/* drop if problems */
 		sbuf_call_proto(sbuf, SBUF_EV_RECV_FAILED);
 		return;
@@ -255,7 +252,6 @@ void sbuf_continue(SBuf *sbuf)
 	 */
 
 	sbuf_main_loop(sbuf, do_recv);
-	slog_debug(sk, "sbuf_continue: sbuf_main_loop returned sock=%d (stall trace)", sbuf->sock);
 }
 
 /*
@@ -496,7 +492,6 @@ static bool sbuf_call_proto(SBuf *sbuf, int event)
 	struct MBuf mbuf;
 	IOBuf *io = sbuf->io;
 	bool res;
-	PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
 
 	AssertSanity(sbuf);
 	Assert(event != SBUF_EV_READ || iobuf_amount_parse(io) > 0);
@@ -506,16 +501,10 @@ static bool sbuf_call_proto(SBuf *sbuf, int event)
 		iobuf_parse_limit(io, &mbuf, sbuf->pkt_remain);
 	} else if (event == SBUF_EV_READ) {
 		iobuf_parse_all(io, &mbuf);
-		if (mbuf.write_pos > 0) {
-			slog_debug(sk, "sbuf_call_proto: calling proto_cb SBUF_EV_READ pkt_type=%c (stall trace)", (char)mbuf.data[0]);
-		}
 	} else {
 		memset(&mbuf, 0, sizeof(mbuf));
 	}
 	res = sbuf->proto_cb(sbuf, event, &mbuf);
-	if (event == SBUF_EV_READ && mbuf.write_pos > 0) {
-		slog_debug(sk, "sbuf_call_proto: proto_cb SBUF_EV_READ pkt_type=%c returned %d (stall trace)", (char)mbuf.data[0], res);
-	}
 
 	AssertSanity(sbuf);
 	Assert(event != SBUF_EV_READ || !res || sbuf->sock > 0);
@@ -579,14 +568,6 @@ static void sbuf_send_cb(evutil_socket_t sock, short flags, void *arg)
 {
 	SBuf *sbuf = arg;
 	bool res;
-	PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
-
-	if (flags & EV_TIMEOUT) {
-		slog_debug(sk, "client write timeout: peer socket did not become writable in time (stall trace)");
-		sbuf_call_proto(sbuf, SBUF_EV_SEND_FAILED);
-		return;
-	}
-	slog_debug(sk, "peer socket writable, resuming send (stall trace)");
 	log_noise("Socket is writable again");
 
 	/* sbuf was closed before in this loop */
@@ -628,23 +609,13 @@ static bool sbuf_queue_send(SBuf *sbuf)
 
 	/* instead wait for EV_WRITE on destination socket */
 	event_assign(&sbuf->ev, pgb_event_base, sbuf->dst->sock, EV_WRITE, sbuf_send_cb, sbuf);
-	if (cf_client_write_timeout > 0) {
-		struct timeval tv;
-		tv.tv_sec = cf_client_write_timeout / 1000000;
-		tv.tv_usec = cf_client_write_timeout % 1000000;
-		err = event_add(&sbuf->ev, &tv);
-	} else {
-		err = event_add(&sbuf->ev, NULL);
-	}
+	err = event_add(&sbuf->ev, NULL);
 	if (err < 0) {
 		log_warning("sbuf_queue_send: event_add failed: %s", strerror(errno));
 		return false;
 	}
 	sbuf->wait_type = W_SEND;
-	{
-		PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
-		slog_debug(sk, "send blocked: waiting for peer socket writable (stall trace)");
-	}
+
 	return true;
 }
 
@@ -691,19 +662,10 @@ try_more:
 	/* actually send it */
 	//res = iobuf_send_pending(io, sbuf->dst->sock);
 	res = sbuf_op_send(sbuf->dst, io->buf + io->done_pos, avail);
-	{
-		PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
-		slog_debug(sk, "send(iobuf): to dst_sock=%d res=%zd avail=%d (stall trace)",
-			   sbuf->dst->sock, (ssize_t)res, avail);
-	}
 	if (res > 0) {
 		io->done_pos += res;
 	} else if (res < 0) {
 		if (errno == EAGAIN) {
-			{
-				PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
-				slog_debug(sk, "send EAGAIN: pending data for peer, waiting for socket writable (stall trace)");
-			}
 			if (!sbuf_queue_send(sbuf)) {
 				/* drop if queue failed */
 				sbuf_call_proto(sbuf, SBUF_EV_SEND_FAILED);
@@ -733,14 +695,9 @@ static bool sbuf_send_pending_extra_packets(SBuf *sbuf)
 	int avail;
 	ssize_t res;
 	struct MBuf *mbuf = &sbuf->extra_packets;
-	PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
 
 	AssertActive(sbuf);
 	Assert(sbuf->dst || mbuf_avail_for_read(mbuf) == 0);
-
-	avail = mbuf_avail_for_read(mbuf);
-	slog_debug(sk, "sbuf_send_pending_extra_packets: entry avail=%d dst_sock=%d (stall trace)",
-		   avail, sbuf->dst ? sbuf->dst->sock : -1);
 	log_noise("sbuf_send_pending_extra_packets ");
 
 try_more:
@@ -758,14 +715,10 @@ try_more:
 	/* actually send it */
 	//res = iobuf_send_pending(io, sbuf->dst->sock);
 	res = sbuf_op_send(sbuf->dst, mbuf->data + mbuf->read_pos, avail);
-	slog_debug(sk, "sbuf_send_pending_extra_packets: sbuf_op_send returned %zd (avail=%d) (stall trace)", (ssize_t)res, avail);
 	if (res > 0) {
 		mbuf->read_pos += res;
 	} else if (res < 0) {
 		if (errno == EAGAIN) {
-			{
-				slog_debug(sk, "send EAGAIN (extra_packets): pending data for peer, waiting for socket writable (stall trace)");
-			}
 			if (!sbuf_queue_send(sbuf)) {
 				/* drop if queue failed */
 				sbuf_call_proto(sbuf, SBUF_EV_SEND_FAILED);
@@ -795,10 +748,6 @@ static bool sbuf_process_pending(SBuf *sbuf)
 	struct MBuf *extra_packets = &sbuf->extra_packets;
 	bool full = iobuf_amount_recv(io) <= 0;
 	int loop_number = 0;
-	PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
-
-	slog_debug(sk, "sbuf_process_pending: entry extra_packets_avail=%d (stall trace)",
-		   (int)mbuf_avail_for_read(extra_packets));
 	log_noise("sbuf_process_pending: start");
 
 	while (1) {
@@ -809,8 +758,6 @@ static bool sbuf_process_pending(SBuf *sbuf)
 		 * would mean they get delivered out of order.
 		 */
 		if (mbuf_avail_for_read(extra_packets)) {
-			slog_debug(sk, "sbuf_process_pending: flushing extra_packets avail=%d extra_packet_queue_after=%d (stall trace)",
-				   (int)mbuf_avail_for_read(extra_packets), sbuf->extra_packet_queue_after);
 			if (sbuf->extra_packet_queue_after) {
 				if (!sbuf_send_pending_iobuf(sbuf)) {
 					log_noise("sbuf_process_pending failed to send all pending data");
@@ -819,7 +766,6 @@ static bool sbuf_process_pending(SBuf *sbuf)
 			}
 
 			if (!sbuf_send_pending_extra_packets(sbuf)) {
-				slog_debug(sk, "sbuf_process_pending: sbuf_send_pending_extra_packets returned false (EAGAIN or error) (stall trace)");
 				log_noise("sbuf_process_pending ended early because of not being able to send the queued extra packets");
 				return false;
 			}
@@ -914,7 +860,6 @@ static bool sbuf_process_pending(SBuf *sbuf)
 	return true;
 
 need_more_data:
-	slog_debug(sk, "sbuf_process_pending: need_more_data (pkt_remain=%u) (stall trace)", sbuf->pkt_remain);
 	/*
 	 * We need to wait for more data before we can handle the current
 	 * packet. We'll call the handler for this packet again after receiving
@@ -981,25 +926,19 @@ static bool sbuf_actual_recv(SBuf *sbuf, size_t len)
 	IOBuf *io = sbuf->io;
 	uint8_t *dst = io->buf + io->recv_pos;
 	unsigned avail = iobuf_amount_recv(io);
-	PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
 	if (len > avail)
 		len = avail;
 	got = sbuf_op_recv(sbuf, dst, len);
 	if (got > 0) {
 		io->recv_pos += got;
-		slog_debug(sk, "recv: got %zd bytes (stall trace)", (ssize_t)got);
 	} else if (got == 0) {
 		/* eof from socket */
-		slog_debug(sk, "recv: eof (stall trace)");
 		sbuf_call_proto(sbuf, SBUF_EV_RECV_FAILED);
 		return false;
 	} else if (got < 0 && errno != EAGAIN) {
 		/* some error occurred */
-		slog_debug(sk, "recv: error %s (stall trace)", strerror(errno));
 		sbuf_call_proto(sbuf, SBUF_EV_RECV_FAILED);
 		return false;
-	} else if (got < 0 && errno == EAGAIN) {
-		slog_debug(sk, "recv: EAGAIN (no data yet) len=%zu (stall trace)", (size_t)len);
 	}
 	return true;
 }
@@ -1037,13 +976,11 @@ static void sbuf_main_loop(SBuf *sbuf, bool skip_recv)
 {
 	unsigned free, ok;
 	int loopcnt = 0;
-	PgSocket *sk = container_of(sbuf, PgSocket, sbuf);
 
 	/* sbuf was closed before in this event loop */
 	if (!sbuf->sock)
 		return;
 
-	slog_debug(sk, "sbuf_main_loop: entry skip_recv=%d sock=%d (stall trace)", skip_recv, sbuf->sock);
 	/* reading should be disabled when waiting */
 	Assert(sbuf->wait_type == W_RECV);
 	AssertSanity(sbuf);
@@ -1100,12 +1037,9 @@ try_more:
 
 skip_recv:
 	/* now handle it */
-	slog_debug(sk, "sbuf_main_loop: calling sbuf_process_pending (stall trace)");
 	ok = sbuf_process_pending(sbuf);
-	if (!ok) {
-		slog_debug(sk, "sbuf_main_loop: sbuf_process_pending returned false (stall trace)");
+	if (!ok)
 		return;
-	}
 
 	/* if the buffer is full, there can be more data available */
 	if (iobuf_amount_recv(sbuf->io) <= 0)

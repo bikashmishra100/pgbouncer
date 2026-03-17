@@ -178,7 +178,6 @@ static void takeover_create_link(PgPool *pool, PgSocket *client)
 	statlist_for_each(item, &pool->active_server_list) {
 		server = container_of(item, PgSocket, head);
 		if (server->tmp_sk_oldfd == client->tmp_sk_linkfd) {
-			client->last_linked_server = server;
 			server->link = client;
 			client->link = server;
 			return;

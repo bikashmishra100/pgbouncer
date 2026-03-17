@@ -24,15 +24,11 @@ typedef struct PgClientPreparedStatement {
 	char stmt_name[];	/* varying size */
 } PgClientPreparedStatement;
 
-/* Prepared statements in Postgres backends. Each server connection uses
- * a unique name (server_stmt_name) to avoid 42P05 when the same server is
- * reused from the pool with a different client or transaction. */
+/* Prepared statements in Postgres backends */
 typedef struct PgServerPreparedStatement {
 	uint64_t query_id;
 	UT_hash_handle hh;
 	PgPreparedStatement *ps;
-	uint8_t server_stmt_name_len;
-	char server_stmt_name[MAX_SERVER_PREPARED_STMT_NAME];
 } PgServerPreparedStatement;
 
 #define is_prepared_statements_enabled(client_or_server) \
@@ -40,9 +36,6 @@ typedef struct PgServerPreparedStatement {
 
 
 bool handle_parse_command(PgSocket *client, PktHdr *pkt);
-bool handle_parse_command_stripped(PgSocket *client, const char *client_stmt_name,
-				   const uint8_t *query_and_parameters, size_t query_and_parameters_len);
-bool client_has_prepared_statement(PgSocket *client, const char *name);
 bool handle_bind_command(PgSocket *client, PktHdr *pkt);
 bool handle_describe_command(PgSocket *client, PktHdr *pkt);
 bool handle_close_statement_command(PgSocket *client, PktHdr *pkt, PgClosePacket *close_packet);

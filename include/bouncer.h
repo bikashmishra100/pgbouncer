@@ -319,7 +319,6 @@ int pga_cmp_addr(const PgAddr *a, const PgAddr *b);
  */
 struct PgStats {
 	uint64_t server_assignment_count;
-	uint64_t connection_switch_count;
 	uint64_t xact_count;
 	uint64_t query_count;
 	uint64_t server_bytes;
@@ -665,10 +664,6 @@ struct PgSocket {
 	struct List head;		/* list header for pool list */
 	struct List cancel_head;	/* list header for server->canceling_clients */
 	PgSocket *link;		/* the dest of packets */
-	PgSocket *last_linked_server;	/* client: server last assigned, for connection_switch_count */
-	bool pool_switched : 1;	/* client: SET pgbouncer.database switched pool without a server linked; next assign counts as switch */
-	bool db_switch_skip_switch : 1;	/* client: already switched for this packet; retry must not call do_switch_database again */
-	bool in_set_pgbouncer_database : 1;	/* client: handling SET pgbouncer.database; count connection_switch once in db_switch_after_switch only */
 	PgPool *pool;		/* parent pool, if NULL not yet assigned */
 
 	PgCredentials *login_user_credentials;	/* presented login, for client it may differ from pool->user */
@@ -768,8 +763,6 @@ struct PgSocket {
 	PgClientPreparedStatement *client_prepared_statements;
 	/* server: prepared statements prepared on this server */
 	PgServerPreparedStatement *server_prepared_statements;
-	/* server: counter for unique prepared statement names on this connection */
-	uint32_t stmt_name_counter;
 
 	/* cb state during SBUF_EV_PKT_CALLBACK processing */
 	struct CallbackState {
@@ -844,7 +837,6 @@ extern usec_t cf_query_wait_timeout;
 extern usec_t cf_cancel_wait_timeout;
 extern usec_t cf_client_idle_timeout;
 extern usec_t cf_client_login_timeout;
-extern usec_t cf_client_write_timeout;
 extern usec_t cf_idle_transaction_timeout;
 extern usec_t cf_transaction_timeout;
 extern bool any_user_level_timeout_set;

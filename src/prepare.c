@@ -100,10 +100,7 @@ static PgClientPreparedStatement *create_client_prepared_statement(char const *n
  * PgClientPreparedStatement can be stored inside the server its prepared
  * statement hashmap.
  */
-/* Create a server-side prepared statement entry with a name unique to this
- * server connection, so the same name is not reused when the server is
- * returned to the pool (avoids 42P05 "already in use"). */
-static PgServerPreparedStatement *create_server_prepared_statement(PgSocket *server, PgPreparedStatement *ps)
+static PgServerPreparedStatement *create_server_prepared_statement(PgPreparedStatement *ps)
 {
 	PgServerPreparedStatement *server_ps = slab_alloc(server_prepared_statement_cache);
 	if (server_ps == NULL)
@@ -111,12 +108,6 @@ static PgServerPreparedStatement *create_server_prepared_statement(PgSocket *ser
 
 	server_ps->ps = ps;
 	server_ps->query_id = ps->query_id;
-	server_ps->server_stmt_name_len = (uint8_t)snprintf(
-		server_ps->server_stmt_name,
-		sizeof(server_ps->server_stmt_name),
-		"PGBOUNCER_%llu_%u",
-		(unsigned long long)server->id,
-		server->stmt_name_counter++);
 	ps->use_count += 1;
 	return server_ps;
 }
@@ -272,7 +263,7 @@ static bool register_prepared_statement(PgSocket *client, PgSocket *server, PgSe
 			break;
 		}
 
-		QUEUE_CloseStmt(res, client, server, current->server_stmt_name);
+		QUEUE_CloseStmt(res, client, server, current->ps->stmt_name);
 		if (!res) {
 			return false;
 		}
@@ -290,7 +281,7 @@ static bool register_prepared_statement(PgSocket *client, PgSocket *server, PgSe
 		 * free the memory yet. Because we might still need to
 		 * add it back if the Close fails.
 		 */
-		slog_noise(server, "prepared statement '%s' deleted from server cache", current->server_stmt_name);
+		slog_noise(server, "prepared statement '%s' deleted from server cache", current->ps->stmt_name);
 		HASH_DEL(server->server_prepared_statements, current);
 	}
 
@@ -362,9 +353,7 @@ bool handle_parse_command(PgSocket *client, PktHdr *pkt)
 		if (server_ps) {
 			/* Statement was already prepared on this server, do not forward packet */
 			slog_debug(client, "handle_parse_command: mapping statement '%s' to '%s' (query '%s')",
-				   client_ps->stmt_name, server_ps->server_stmt_name, ps->query_and_parameters);
-			slog_debug(client, "stall trace: Parse client_stmt=%s server_stmt=%s -> RA_FAKE (already on server)",
-				   client_ps->stmt_name, server_ps->server_stmt_name);
+				   client_ps->stmt_name, ps->stmt_name, ps->query_and_parameters);
 
 			/*
 			 * Insert an entry into the request queue, so we can send a fake
@@ -375,17 +364,12 @@ bool handle_parse_command(PgSocket *client, PktHdr *pkt)
 			goto success;
 		}
 	}
-	/* Statement was not prepared on this server, send Parse with per-server unique name */
-	server_ps = create_server_prepared_statement(server, ps);
-	if (!server_ps)
-		goto oom;
-	slog_debug(client, "stall trace: Parse client_stmt=%s server_stmt=%s -> sending to server (RA_FORWARD)",
-		   client_ps->stmt_name, server_ps->server_stmt_name);
+	/* Statement was not prepared on this server, sent modified P packet */
 	slog_debug(client, "handle_parse_command: creating mapping for statement '%s' to '%s' (query '%s')",
-		   client_ps->stmt_name, server_ps->server_stmt_name, ps->query_and_parameters);
+		   client_ps->stmt_name, ps->stmt_name, ps->query_and_parameters);
 
 	buf = pktbuf_temp();
-	pktbuf_write_Parse(buf, server_ps->server_stmt_name, ps->query_and_parameters, ps->query_and_parameters_len);
+	pktbuf_write_Parse(buf, ps->stmt_name, ps->query_and_parameters, ps->query_and_parameters_len);
 	if (!sbuf_queue_packet(&client->sbuf, &server->sbuf, buf))
 		goto oom;
 
@@ -399,6 +383,10 @@ bool handle_parse_command(PgSocket *client, PktHdr *pkt)
 	if (!add_outstanding_request(client, PqMsg_Parse, RA_FORWARD))
 		goto oom;
 
+	/* Register statement on server */
+	server_ps = create_server_prepared_statement(ps);
+	if (!server_ps)
+		goto oom;
 	if (!register_prepared_statement(client, server, server_ps))
 		goto oom;
 
@@ -415,123 +403,6 @@ oom:
 	 * at this prepared statement state at this point. And rolling that back is
 	 * hard.
 	 */
-	disconnect_server(client->link, true, "out of memory");
-	return false;
-}
-
-/*
- * Same as handle_parse_command but for a Parse whose query was stripped
- * (e.g. SET pgbouncer.database removed). Registers client_stmt_name -> canonical
- * server statement (by stripped query) so Bind/Describe/Close work after DB switch.
- */
-bool handle_parse_command_stripped(PgSocket *client, const char *client_stmt_name,
-				   const uint8_t *query_and_parameters, size_t query_and_parameters_len)
-{
-	PgSocket *server = client->link;
-	PgParsePacket pp;
-	PgServerPreparedStatement *server_ps = NULL;
-	PgClientPreparedStatement *client_ps = NULL;
-	PgPreparedStatement *ps;
-	PktBuf *buf;
-	bool found = false;
-
-	Assert(server);
-
-	/*
-	 * We are in "just switched database" context. Do not trust the server's
-	 * prepared statement cache (e.g. from a previous user or retry). We must
-	 * run the server reset query first so the server actually drops its
-	 * prepared statements; only then clear our cache and send Parse. Otherwise
-	 * we would send Parse for a name that still exists on the server (42P05).
-	 */
-	if (connection_pool_mode(server) != POOL_SESSION && is_prepared_statements_enabled(server)) {
-		if (cf_server_reset_query && *cf_server_reset_query) {
-			PktBuf *reset_buf = pktbuf_temp();
-			if (!reset_buf)
-				return false;
-			pktbuf_write_generic(reset_buf, PqMsg_Query, "s", cf_server_reset_query);
-			slog_debug(client, "stall trace: parse_stripped queueing server_reset_query then Parse");
-			if (!sbuf_queue_packet(&client->sbuf, &server->sbuf, reset_buf))
-				return false;
-			if (!add_outstanding_request(client, PqMsg_Query, RA_SKIP))
-				return false;
-		}
-		free_server_prepared_statements(server);
-	}
-
-	HASH_FIND_STR(client->client_prepared_statements, client_stmt_name, client_ps);
-	if (client_ps) {
-		/* Re-Parse with same name (e.g. after SET pgbouncer.database switch). Allow if same query. */
-		ps = client_ps->ps;
-		if (ps->query_and_parameters_len == query_and_parameters_len &&
-		    memcmp(ps->query_and_parameters, query_and_parameters, query_and_parameters_len) == 0) {
-			/* After DB switch always send Parse to backend with a new per-server name. */
-			server_ps = create_server_prepared_statement(server, ps);
-			if (!server_ps)
-				return false;
-			slog_debug(client, "stall trace: parse_stripped re-parse same query server_stmt=%s", server_ps->server_stmt_name);
-			buf = pktbuf_temp();
-			pktbuf_write_Parse(buf, server_ps->server_stmt_name, ps->query_and_parameters, ps->query_and_parameters_len);
-			if (!sbuf_queue_packet(&client->sbuf, &server->sbuf, buf))
-				return false;
-			client->pool->stats.ps_server_parse_count++;
-			if (!add_outstanding_request(client, PqMsg_Parse, RA_FORWARD))
-				return false;
-			if (!register_prepared_statement(client, server, server_ps))
-				return false;
-			return true;
-		}
-		slog_error(client, "prepared statement '%s' was already prepared", client_stmt_name);
-		disconnect_client(client, true, "prepared statement name is already in use");
-		return false;
-	}
-
-	client->pool->stats.ps_client_parse_count++;
-
-	pp.name = client_stmt_name;
-	pp.query_and_parameters = (const char *)query_and_parameters;
-	pp.query_and_parameters_len = query_and_parameters_len;
-
-	ps = get_prepared_statement(&pp, &found);
-	if (ps == NULL)
-		goto oom;
-
-	client_ps = create_client_prepared_statement(pp.name, ps);
-	if (client_ps == NULL)
-		goto oom;
-	HASH_ADD_STR(client->client_prepared_statements, stmt_name, client_ps);
-	if (uthash_alloc_failed) {
-		uthash_alloc_failed = false;
-		goto oom;
-	}
-
-	/* After DB switch always send Parse to backend with per-server unique name. */
-	server_ps = create_server_prepared_statement(server, ps);
-	if (!server_ps)
-		goto oom;
-	slog_debug(client, "stall trace: parse_stripped sending Parse server_stmt=%s", server_ps->server_stmt_name);
-	slog_debug(client, "handle_parse_command_stripped: creating mapping for statement '%s' to '%s' (query '%s')",
-		   client_ps->stmt_name, server_ps->server_stmt_name, ps->query_and_parameters);
-
-	buf = pktbuf_temp();
-	pktbuf_write_Parse(buf, server_ps->server_stmt_name, ps->query_and_parameters, ps->query_and_parameters_len);
-	if (!sbuf_queue_packet(&client->sbuf, &server->sbuf, buf))
-		goto oom;
-
-	client->pool->stats.ps_server_parse_count++;
-
-	if (!add_outstanding_request(client, PqMsg_Parse, RA_FORWARD))
-		goto oom;
-
-	if (!register_prepared_statement(client, server, server_ps))
-		goto oom;
-
-	return true;
-
-oom:
-	free(client_ps);
-	free_server_prepared_statement(server_ps);
-	disconnect_client(client, true, "out of memory");
 	disconnect_server(client->link, true, "out of memory");
 	return false;
 }
@@ -560,13 +431,6 @@ static PgClientPreparedStatement *get_client_prepared_statement(PgSocket *client
 		disconnect_client(client, true, "prepared statement did not exist");
 	}
 	return client_ps;
-}
-
-bool client_has_prepared_statement(PgSocket *client, const char *name)
-{
-	PgClientPreparedStatement *client_ps = NULL;
-	HASH_FIND_STR(client->client_prepared_statements, name, client_ps);
-	return client_ps != NULL;
 }
 
 /*
@@ -598,14 +462,9 @@ static bool ensure_statement_is_prepared_on_server(PgSocket *server, PgPreparedS
 		return true;
 	}
 
-	/* Statement is not prepared on this link, send Parse with per-server unique name */
-	server_ps = create_server_prepared_statement(server, ps);
-	if (!server_ps)
-		return false;
-	slog_debug(server, "stall trace: ensure_prepared_on_server sending Parse '%s' (prepare-before-bind)",
-		   server_ps->server_stmt_name);
+	/* Statement is not prepared on this link, sent P packet now */
 	slog_debug(server, "handle_bind_command: prepared statement '%s' (query '%s') not available on server, preparing '%s' before bind",
-		   server_ps->server_stmt_name, ps->query_and_parameters, server_ps->server_stmt_name);
+		   ps->stmt_name, ps->query_and_parameters, ps->stmt_name);
 
 	/* update stats */
 	client->pool->stats.ps_server_parse_count++;
@@ -619,12 +478,14 @@ static bool ensure_statement_is_prepared_on_server(PgSocket *server, PgPreparedS
 		return false;
 
 	buf = pktbuf_temp();
-	pktbuf_write_Parse(buf, server_ps->server_stmt_name, ps->query_and_parameters, ps->query_and_parameters_len);
+	pktbuf_write_Parse(buf, ps->stmt_name, ps->query_and_parameters, ps->query_and_parameters_len);
 	if (!sbuf_queue_packet(&client->sbuf, &server->sbuf, buf))
 		return false;
-	slog_debug(server, "prepare-before-bind: queued Parse to server, outstanding=%d (stall trace)",
-		   statlist_count(&server->outstanding_requests));
 
+	/* Register statement on server link */
+	server_ps = create_server_prepared_statement(ps);
+	if (!server_ps)
+		return false;
 	if (!register_prepared_statement(client, server, server_ps)) {
 		free_server_prepared_statement(server_ps);
 		return false;
@@ -647,15 +508,14 @@ bool handle_bind_command(PgSocket *client, PktHdr *pkt)
 	PgSocket *server = client->link;
 	PgBindPacket bp;
 	PgClientPreparedStatement *client_ps = NULL;
-	PgServerPreparedStatement *server_ps = NULL;
 	PgPreparedStatement *ps;
 	PktBuf *buf;
 	int diff;
 
+	Assert(server);
+
 	if (!unmarshall_bind_packet(client, pkt, &bp))
 		return false;
-
-	Assert(server);
 
 	/* update stats */
 	client->pool->stats.ps_bind_count++;
@@ -668,12 +528,8 @@ bool handle_bind_command(PgSocket *client, PktHdr *pkt)
 	if (!ensure_statement_is_prepared_on_server(server, ps))
 		goto oom;
 
-	HASH_FIND_UINT64(server->server_prepared_statements, &ps->query_id, server_ps);
-	if (!server_ps)
-		goto oom;
-
 	slog_debug(client, "handle_bind_command: mapped statement '%s' (query '%s') to '%s'",
-		   bp.name, ps->query_and_parameters, server_ps->server_stmt_name);
+		   bp.name, ps->query_and_parameters, ps->stmt_name);
 
 
 	/*
@@ -690,7 +546,7 @@ bool handle_bind_command(PgSocket *client, PktHdr *pkt)
 	 * length. Those are the only changes that we wish to make though, and
 	 * the rest of the packet can be forwarded as is.
 	 */
-	diff = strlen(bp.name) - server_ps->server_stmt_name_len;
+	diff = strlen(bp.name) - ps->stmt_name_len;
 	buf = pktbuf_temp();
 	if (buf == NULL)
 		goto oom;
@@ -701,7 +557,7 @@ bool handle_bind_command(PgSocket *client, PktHdr *pkt)
 	 */
 	pktbuf_put_uint32(buf, pkt->len - diff - 1);
 	pktbuf_put_string(buf, bp.portal);
-	pktbuf_put_string(buf, server_ps->server_stmt_name);
+	pktbuf_put_string(buf, ps->stmt_name);
 
 	if (client->packet_cb_state.flag == CB_HANDLE_COMPLETE_PACKET) {
 		/*
@@ -731,8 +587,6 @@ bool handle_bind_command(PgSocket *client, PktHdr *pkt)
 	 */
 	if (!sbuf_queue_packet(&client->sbuf, &server->sbuf, buf))
 		goto oom;
-	slog_debug(client, "handle_bind_command: queued Bind to server, outstanding=%d (stall trace)",
-		   statlist_count(&server->outstanding_requests));
 
 	sbuf_prepare_skip_then_send_leftover(&client->sbuf, &server->sbuf, pkt->data.read_pos, pkt->len);
 	return true;
@@ -761,7 +615,6 @@ bool handle_describe_command(PgSocket *client, PktHdr *pkt)
 	PgSocket *server = client->link;
 	PgDescribePacket dp;
 	PgClientPreparedStatement *client_ps = NULL;
-	PgServerPreparedStatement *server_ps = NULL;
 	PgPreparedStatement *ps;
 	bool res;
 
@@ -778,12 +631,8 @@ bool handle_describe_command(PgSocket *client, PktHdr *pkt)
 	if (!ensure_statement_is_prepared_on_server(server, ps))
 		goto oom;
 
-	HASH_FIND_UINT64(server->server_prepared_statements, &ps->query_id, server_ps);
-	if (!server_ps)
-		goto oom;
-
 	slog_debug(client, "handle_describe_command: mapped statement '%s' (query '%s') to '%s'",
-		   dp.name, ps->query_and_parameters, server_ps->server_stmt_name);
+		   dp.name, ps->query_and_parameters, ps->stmt_name);
 
 	/*
 	 * Track the Describe command that we send to server and forward the
@@ -793,7 +642,7 @@ bool handle_describe_command(PgSocket *client, PktHdr *pkt)
 		goto oom;
 
 	skip_possibly_completely_buffered_packet(client, pkt);
-	QUEUE_DescribeStmt(res, client, server, server_ps->server_stmt_name);
+	QUEUE_DescribeStmt(res, client, server, ps->stmt_name);
 	return res;
 oom:
 	disconnect_client(client, true, "out of memory");

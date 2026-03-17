@@ -655,7 +655,6 @@ bool send_startup_packet(PgSocket *server)
 		 * forwarded, because physical replication connections don't allow SET
 		 * commands. Another reason is so that we don't need a separate state.
 		 */
-		client->last_linked_server = server;
 		client->link = server;
 		server->link = client;
 	}

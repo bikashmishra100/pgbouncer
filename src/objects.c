@@ -891,8 +891,8 @@ bool check_fast_fail(PgSocket *client)
 	return false;
 }
 
-/* link if found, otherwise put into wait queue (or return false if !allow_pause) */
-bool find_server(PgSocket *client, bool allow_pause)
+/* link if found, otherwise put into wait queue */
+bool find_server(PgSocket *client)
 {
 	PgPool *pool = client->pool;
 	PgSocket *server;
@@ -936,14 +936,8 @@ bool find_server(PgSocket *client, bool allow_pause)
 			}
 		}
 
-		if (!server) {
-			slog_debug(client, "find_server: no idle server for db=%s (idle=%d waiting=%d)",
-				   pool->db->name,
-				   statlist_count(&pool->idle_server_list),
-				   statlist_count(&pool->waiting_client_list));
-			if (!check_fast_fail(client))
-				return false;
-		}
+		if (!server && !check_fast_fail(client))
+			return false;
 	}
 	Assert(!server || server->state == SV_IDLE);
 
@@ -966,25 +960,9 @@ bool find_server(PgSocket *client, bool allow_pause)
 
 	/* link or send to waiters list */
 	if (server) {
-		slog_debug(client, "find_server: linking client to server db=%s (idle was available)",
-			  pool->db->name);
 		slog_noise(client, "linking client to S-%p", server);
-		/* Link client and server first so any code that needs client->link (e.g.
-		 * add_outstanding_request) has it set. */
-		client->pool_switched = false;
-		client->last_linked_server = server;
 		client->link = server;
 		server->link = client;
-		/* Do not clear server prepared statement cache when linking in transaction/
-		 * statement mode. The server was not reset on release (no server_reset_query
-		 * in that mode), so it still has the same prepared statements. If we clear
-		 * our cache here we send a duplicate Parse (prepare-before-bind), get 42P05,
-		 * and the server discards the following Bind; we then wait forever for
-		 * BindComplete. Keeping the cache in sync with the server avoids that. */
-		/* Count every server assignment so the stat reflects activity (short-lived connections often have only one assign).
-		 * When handling SET pgbouncer.database we count once in db_switch_after_switch instead. */
-		if (!client->in_set_pgbouncer_database)
-			server->pool->stats.connection_switch_count++;
 		server->pool->stats.server_assignment_count++;
 		change_server_state(server, SV_ACTIVE);
 		if (varchange) {
@@ -998,11 +976,7 @@ bool find_server(PgSocket *client, bool allow_pause)
 			res = true;
 		}
 	} else {
-		if (allow_pause) {
-			slog_debug(client, "find_server: pausing client (no server) db=%s waiting_count=%d",
-				   pool->db->name, statlist_count(&pool->waiting_client_list));
-			pause_client(client);
-		}
+		pause_client(client);
 		res = false;
 	}
 	return res;
@@ -1015,11 +989,9 @@ static bool reuse_on_release(PgSocket *server)
 	PgPool *pool = server->pool;
 	PgSocket *client;
 	Assert(!server->replication);
+	slog_debug(server, "reuse_on_release: replication %d", server->replication);
 	client = first_socket(&pool->waiting_client_list);
-	slog_debug(server, "reuse_on_release: db=%s waiting_clients=%d",
-		   pool->db->name, statlist_count(&pool->waiting_client_list));
 	if (client && (!client->replication || sending_auth_query(client))) {
-		slog_debug(server, "reuse_on_release: activating waiting client for db=%s", pool->db->name);
 		activate_client(client);
 
 		/*
@@ -1108,9 +1080,6 @@ bool add_outstanding_request(PgSocket *client, char type, ResponseAction action)
 	statlist_append(&server->outstanding_requests, &request->node);
 	slog_noise(client, "add_outstanding_request: added %c, still outstanding %d",
 		   type, statlist_count(&client->link->outstanding_requests));
-	slog_debug(server, "stall trace: add_outstanding type=%c action=%s outstanding=%d",
-		   type, action == RA_SKIP ? "SKIP" : action == RA_FAKE ? "FAKE" : "FORWARD",
-		   statlist_count(&server->outstanding_requests));
 	return true;
 }
 
@@ -1124,10 +1093,8 @@ bool pop_outstanding_request(PgSocket *server, const char types[], bool *skip)
 {
 	OutstandingRequest *request;
 	struct List *item = statlist_first(&server->outstanding_requests);
-	if (!item) {
-		slog_debug(server, "stall trace: pop_outstanding failed (empty queue)");
+	if (!item)
 		return false;
-	}
 
 	request = container_of(item, OutstandingRequest, node);
 	if (request->action == RA_FAKE) {
@@ -1139,19 +1106,14 @@ bool pop_outstanding_request(PgSocket *server, const char types[], bool *skip)
 		return false;
 	}
 
-	if (strchr(types, request->type) == NULL) {
-		slog_debug(server, "stall trace: pop_outstanding failed first=%c (expected types in list) outstanding=%d",
-			   request->type, statlist_count(&server->outstanding_requests));
+	if (strchr(types, request->type) == NULL)
 		return false;
-	}
 
 	statlist_pop(&server->outstanding_requests);
 	if (skip)
 		*skip = request->action == RA_SKIP;
 	slog_noise(server, "pop_outstanding_request: popped %c, still outstanding %d, skip %d",
 		   request->type, statlist_count(&server->outstanding_requests), request->action == RA_SKIP);
-	slog_debug(server, "stall trace: pop_outstanding popped %c skip=%d remaining=%d",
-		   request->type, request->action == RA_SKIP, statlist_count(&server->outstanding_requests));
 	if (request->server_ps != NULL) {
 		free_server_prepared_statement(request->server_ps);
 	}
@@ -1161,21 +1123,16 @@ bool pop_outstanding_request(PgSocket *server, const char types[], bool *skip)
 
 /*
  * Clear all outstanding requests until we reach response of any of the message
- * types in "types". If unregister_parses is true, Parse requests are
- * unregistered from the server cache (for error paths). If false, Parse
- * entries are left in the cache (successful round-trip, e.g. extended
- * protocol). Close requests are re-registered when cleared.
+ * types in "types". Any Parse or Close statement requests that were still
+ * outstanding will be unregistered or re-registered from the server its cache.
  */
-bool clear_outstanding_requests_until(PgSocket *server, const char types[], bool unregister_parses)
+bool clear_outstanding_requests_until(PgSocket *server, const char types[])
 {
 	struct List *item, *tmp;
-	int count_before = statlist_count(&server->outstanding_requests);
-	slog_debug(server, "stall trace: clear_outstanding_until unregister_parses=%d count_before=%d",
-		   unregister_parses, count_before);
 	statlist_for_each_safe(item, &server->outstanding_requests, tmp) {
 		OutstandingRequest *request = container_of(item, OutstandingRequest, node);
 		char type = request->type;
-		if (type == PqMsg_Parse && unregister_parses && request->server_ps_query_id > 0) {
+		if (type == PqMsg_Parse && request->server_ps_query_id > 0) {
 			unregister_prepared_statement(server, request->server_ps_query_id);
 			slog_noise(server,
 				   "failed prepared statement '" PREPARED_STMT_NAME_FORMAT "' removed from server cache, %d cached items",
@@ -1190,7 +1147,7 @@ bool clear_outstanding_requests_until(PgSocket *server, const char types[], bool
 			}
 			slog_noise(server,
 				   "prepared statement '%s' added back to server cache, %d cached items",
-				   request->server_ps->server_stmt_name,
+				   request->server_ps->ps->stmt_name,
 				   HASH_COUNT(server->server_prepared_statements));
 		}
 		statlist_remove(&server->outstanding_requests, item);
@@ -1200,8 +1157,6 @@ bool clear_outstanding_requests_until(PgSocket *server, const char types[], bool
 			break;
 	}
 	slog_noise(server, "clear_outstanding_requests_until_sync: still outstanding %d", statlist_count(&server->outstanding_requests));
-	slog_debug(server, "stall trace: clear_outstanding_until done count_after=%d",
-		   statlist_count(&server->outstanding_requests));
 	return true;
 }
 
@@ -1214,13 +1169,8 @@ static bool reset_on_release(PgSocket *server)
 
 	slog_debug(server, "resetting: %s", cf_server_reset_query);
 	SEND_generic(res, server, PqMsg_Query, "s", cf_server_reset_query);
-	if (!res) {
+	if (!res)
 		disconnect_server(server, false, "reset query failed");
-		return res;
-	}
-	/* Reset query (e.g. DISCARD ALL) clears server prepared statements; keep cache in sync. */
-	if (is_prepared_statements_enabled(server))
-		free_server_prepared_statements(server);
 	return res;
 }
 
@@ -1264,7 +1214,6 @@ bool release_server(PgSocket *server)
 	case SV_BEING_CANCELED:
 	case SV_ACTIVE:
 		if (server->link) {
-			server->link->last_linked_server = server;
 			server->link->link = NULL;
 			server->link = NULL;
 		}
@@ -1321,8 +1270,6 @@ bool release_server(PgSocket *server)
 		 * responses when it does not expect them. To be on the safe
 		 * side we simply close this connection.
 		 */
-		slog_debug(server, "release_server: cannot release db=%s outstanding_requests=%d (will disconnect)",
-			   pool->db->name, statlist_count(&server->outstanding_requests));
 		disconnect_server(server, true, "client disconnected with queries in progress");
 		return true;
 	}
@@ -1351,8 +1298,6 @@ bool release_server(PgSocket *server)
 	}
 
 	Assert(server->link == NULL);
-	slog_debug(server, "release_server: db=%s pool_mode=%d newstate=%d (transaction ended, server back to pool)",
-		   pool->db->name, connection_pool_mode(server), newstate);
 	slog_noise(server, "release_server: new state=%d", newstate);
 	change_server_state(server, newstate);
 

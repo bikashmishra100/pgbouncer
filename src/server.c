@@ -365,9 +365,6 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 	bool ignore_packet = false;
 
 	Assert(!server->pool->db->admin);
-	slog_debug(server, "server pkt type=%c outstanding=%d link=%s (stall trace)",
-		   pkt_desc(pkt), statlist_count(&server->outstanding_requests),
-		   server->link ? "yes" : "no");
 
 	switch (pkt->type) {
 	default:
@@ -382,42 +379,16 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		if (!mbuf_get_char(&pkt->data, &state))
 			return false;
 
-		if (!pop_outstanding_request(server, (char[]) {PqMsg_Sync, PqMsg_Query, PqMsg_FunctionCall, '\0'}, &ignore_packet)) {
-			/*
-			 * First outstanding is not Sync/Query/FunctionCall. Either:
-			 * - ReadyForQuery for a previous simple Query we already popped (e.g. SET
-			 *   pgbouncer.database): first is Parse. Skip this Z, do not clear queue.
-			 * - ReadyForQuery from our internal Parse (prepare-before-bind): first is
-			 *   Bind/Describe/Execute. Skip, client is waiting for BindComplete etc.
-			 */
-			struct List *first_item = statlist_first(&server->outstanding_requests);
-			if (first_item) {
-				OutstandingRequest *req = container_of(first_item, OutstandingRequest, node);
-				slog_debug(server, "stall trace: ReadyForQuery pop failed first_outstanding=%c (expected Sync/Query/FunctionCall)",
-					   req->type);
-				slog_debug(server, "ReadyForQuery: first outstanding=%c (stall trace)", req->type);
-				if (req->type == PqMsg_Parse ||
-				    req->type == PqMsg_Bind || req->type == PqMsg_Describe || req->type == PqMsg_Execute) {
-					ignore_packet = true;
-					slog_debug(server, "ReadyForQuery: skipping (trailing Z for previous Query or internal Parse), outstanding=%d (stall trace)",
-						   statlist_count(&server->outstanding_requests));
-				}
-			}
-			if (!ignore_packet) {
-				slog_debug(server, "ReadyForQuery: clear_outstanding_requests_until Sync/Query/FunctionCall (stall trace)");
-				/* Extended protocol has Parse first; clear full round-trip up to Sync/Query/FunctionCall.
-				 * Do not unregister Parse entries: the round-trip succeeded, server still has them. */
-				if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_Sync, PqMsg_Query, PqMsg_FunctionCall, '\0'}, false))
-					return false;
-			}
+		if (!pop_outstanding_request(server, (char[]) {PqMsg_Sync, PqMsg_Query, PqMsg_FunctionCall, '\0'}, &ignore_packet)
+		    && server->query_failed) {
+			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_Sync, '\0'}))
+				return false;
 		}
 		server->query_failed = false;
 
 		/* set ready only if no tx */
 		if (state == 'I') {
 			ready = true;
-			slog_debug(server, "ReadyForQuery state=Idle: transaction ended, server will be released to pool db=%s",
-				   server->pool->db->name);
 		} else if (connection_pool_mode(server) == POOL_STMT) {
 			disconnect_server(server, true, "transaction blocks not allowed in statement pooling mode");
 			return false;
@@ -441,7 +412,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 	 * dying backend.  It is better to tag server as dirty and drop
 	 * it later.
 	 */
-		case PqMsg_ErrorResponse:
+	case PqMsg_ErrorResponse:
 		if (server->setting_vars) {
 			/*
 			 * the SET and user query will be different TX
@@ -456,48 +427,6 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			 */
 			disconnect_server(server, true, "invalid server parameter");
 			return false;
-		}
-
-		/* 42P05 = duplicate_prepared_statement: we cleared cache on link and sent Parse
-		 * but server still had the statement; treat as success.
-		 * If the client sent Parse (RA_FORWARD), send fake ParseComplete. If it was our
-		 * internal Parse (RA_SKIP, e.g. prepare-before-bind), just pop and skip - the
-		 * client sent Bind and will get BindComplete from the server. */
-		if (client && is_prepared_statements_enabled(server)) {
-			const char *level, *msg, *sqlstate;
-			struct List *first_item = statlist_first(&server->outstanding_requests);
-			parse_server_error(pkt, &level, &msg, &sqlstate);
-			slog_debug(server, "stall trace: ErrorResponse sqlstate=%s first_outstanding=%c outstanding=%d",
-				   sqlstate ? sqlstate : "?", first_item ? (container_of(first_item, OutstandingRequest, node))->type : '?',
-				   statlist_count(&server->outstanding_requests));
-			if (sqlstate && strcmp(sqlstate, "42P05") == 0 && first_item) {
-				OutstandingRequest *req = container_of(first_item, OutstandingRequest, node);
-				if (req->type == PqMsg_Parse) {
-					bool internal_parse = (req->action == RA_SKIP);
-					slog_debug(server, "42P05 duplicate_prepared_statement: popping Parse action=%s (stall trace)",
-						   internal_parse ? "RA_SKIP" : "RA_FORWARD");
-					pop_outstanding_request(server, (char[]) {PqMsg_Parse, '\0'}, &ignore_packet);
-					if (!internal_parse) {
-						if (!queue_fake_response(client, PqMsg_Parse))
-							return false;
-					} else {
-						slog_debug(server, "42P05: not queueing fake ParseComplete (internal Parse) (stall trace)");
-					}
-					sbuf_prepare_skip(sbuf, pkt->len);
-					/*
-					 * Do not call sbuf_continue(server) here: it would re-enter the server
-					 * read path and process the next packet (ReadyForQuery) while we are
-					 * still handling this one, corrupting skip state and causing a segfault.
-					 * The normal loop will process ReadyForQuery next; pending send (Bind)
-					 * is flushed in sbuf_process_pending before the next packet is handled.
-					 */
-					slog_debug(server, "42P05: skipped ErrorResponse, outstanding=%d (stall trace)",
-						   statlist_count(&server->outstanding_requests));
-					slog_debug(server, "42P05: next from server will be ReadyForQuery, then BindComplete/RowDescription/... for client B,D,E,S (stall trace)");
-					return true;
-				}
-			}
-			slog_debug(server, "stall trace: ErrorResponse not 42P05 or no Parse at head, will forward to client");
 		}
 
 		/* ErrorResponse and CommandComplete show end of copy mode */
@@ -524,7 +453,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			 * COPY for some reason unknown to the client (e.g. a
 			 * unique constraint violation).
 			 */
-			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_CopyDone, PqMsg_CopyFail, '\0'}, true))
+			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_CopyDone, PqMsg_CopyFail, '\0'}))
 				return false;
 		}
 
@@ -543,7 +472,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			 * outstanding requests queue, for which we don't
 			 * expect a response from the server.
 			 */
-			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_CopyDone, '\0'}, true))
+			if (!clear_outstanding_requests_until(server, (char[]) {PqMsg_CopyDone, '\0'}))
 				return false;
 		}
 		/*
@@ -552,10 +481,6 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		 * confuse our prepared statement handling, because we would
 		 * expect certain queries to be prepared at the server that are
 		 * not.
-		 * Do not free client prepared statements when the completed
-		 * Query is our internal reset (RA_SKIP), e.g. from
-		 * handle_parse_command_stripped; we just registered client
-		 * statements for the following Parse.
 		 */
 		if (is_prepared_statements_enabled(server)
 		    && (pkt->len == 1 + 4 + 15 || pkt->len == 1 + 4 + 12)) {	/* size of complete DEALLOCATE/DISCARD ALL */
@@ -563,27 +488,16 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			if (mbuf_get_string(&pkt->data, &tag)) {
 				if (strcmp(tag, "DEALLOCATE ALL") == 0 ||
 				    strcmp(tag, "DISCARD ALL") == 0) {
-					struct List *first_item = statlist_first(&server->outstanding_requests);
-					OutstandingRequest *req = first_item ? container_of(first_item, OutstandingRequest, node) : NULL;
-					bool our_reset = req && req->type == PqMsg_Query && req->action == RA_SKIP;
-
 					free_server_prepared_statements(server);
-					if (client && !our_reset)
+					if (client)
 						free_client_prepared_statements(client);
 				}
 			} else {
 				return false;
 			}
 		}
-		{
-			struct List *first_item = statlist_first(&server->outstanding_requests);
-			char first_type = first_item ? (container_of(first_item, OutstandingRequest, node))->type : '?';
-			slog_debug(server, "stall trace: CommandComplete first_outstanding=%c outstanding=%d",
-				   first_type, statlist_count(&server->outstanding_requests));
-		}
-		/* CommandComplete is sent for both Execute (client query) and Query (e.g. our DISCARD ALL). Pop whichever is first. */
-		if (!pop_outstanding_request(server, (char[]) {PqMsg_Execute, PqMsg_Query, '\0'}, &ignore_packet))
-			slog_debug(server, "stall trace: CommandComplete pop failed (expected Execute or Query)");
+		pop_outstanding_request(server, (char[]) {PqMsg_Execute, '\0'}, &ignore_packet);
+
 		break;
 
 	case PqMsg_NoticeResponse:
@@ -606,22 +520,16 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		break;
 	/* chat packets */
 	case PqMsg_ParseComplete:
-		slog_debug(server, "server ParseComplete, popping Parse (stall trace)");
 		pop_outstanding_request(server, (char[]) {PqMsg_Parse, '\0'}, &ignore_packet);
 		break;
 	case PqMsg_BindComplete:
-		slog_debug(server, "server BindComplete, popping Bind outstanding=%d (stall trace)",
-			   statlist_count(&server->outstanding_requests));
 		pop_outstanding_request(server, (char[]) {PqMsg_Bind, '\0'}, &ignore_packet);
-		slog_debug(server, "BindComplete: backend responded after prepare-before-bind (stall trace)");
 		break;
 	case PqMsg_CloseComplete:
 		pop_outstanding_request(server, (char[]) {PqMsg_Close, '\0'}, &ignore_packet);
 		break;
 	case PqMsg_NoData:
 	case PqMsg_RowDescription:
-		slog_debug(server, "server RowDescription/NoData, popping Describe outstanding=%d (stall trace)",
-			   statlist_count(&server->outstanding_requests));
 		pop_outstanding_request(server, (char[]) {PqMsg_Describe, '\0'}, &ignore_packet);
 		break;
 	case PqMsg_ParameterDescription:
@@ -650,41 +558,9 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		if (client->state == CL_LOGIN) {
 			return handle_auth_query_response(client, pkt);
 		} else if (ignore_packet) {
-			slog_debug(server, "not forwarding packet type=%c to client (stall trace)", pkt->type);
+			slog_noise(server, "not forwarding packet with type '%c' from server", pkt->type);
 			sbuf_prepare_skip(sbuf, pkt->len);
-			slog_debug(server, "after skip: outstanding=%d (stall trace)", statlist_count(&server->outstanding_requests));
-			slog_debug(server, "waiting for server to send: BindComplete, RowDescription/NoData, CommandComplete, ReadyForQuery (stall trace)");
 		} else {
-			/*
-			 * Send any leading RA_FAKE responses before the current packet, so
-			 * the client receives responses in the order it expects (e.g. fake
-			 * ParseComplete before BindComplete/RowDescription/ReadyForQuery).
-			 * Previously we only queued them in the ReadyForQuery block with
-			 * extra_packet_queue_after=true, which sent them after ReadyForQuery
-			 * and could leave the client stuck waiting for RowDescription.
-			 */
-			{
-				struct List *fake_item;
-				while ((fake_item = statlist_first(&server->outstanding_requests)) != NULL) {
-					OutstandingRequest *req = container_of(fake_item, OutstandingRequest, node);
-					if (req->action != RA_FAKE)
-						break;
-					statlist_pop(&server->outstanding_requests);
-					sbuf->extra_packet_queue_after = false;
-					if (!queue_fake_response(client, req->type)) {
-						disconnect_client(client, true, "out of memory");
-						disconnect_server(server, true, "out of memory");
-						return false;
-					}
-					slab_free(outstanding_request_cache, req);
-				}
-			}
-			if (pkt->type == PqMsg_ReadyForQuery)
-				slog_debug(server, "forwarding ReadyForQuery to client len=%u (stall trace)", pkt->len);
-			else if (pkt->type == PqMsg_BindComplete || pkt->type == PqMsg_RowDescription ||
-				 pkt->type == PqMsg_DataRow || pkt->type == PqMsg_CommandComplete)
-				slog_debug(server, "forwarding to client type=%c len=%u outstanding=%d (stall trace)",
-					   pkt->type, pkt->len, statlist_count(&server->outstanding_requests));
 			sbuf_prepare_send(sbuf, &client->sbuf, pkt->len);
 
 			/*
@@ -756,11 +632,10 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			}
 		}
 	} else {
-		/* Can happen when client disconnected before server responded; drain and skip. */
 		if (server->state != SV_TESTED) {
-			slog_noise(server,
-				   "got packet '%c' from server when not linked (client likely disconnected)",
-				   pkt_desc(pkt));
+			slog_warning(server,
+				     "got packet '%c' from server when not linked",
+				     pkt_desc(pkt));
 		}
 		sbuf_prepare_skip(sbuf, pkt->len);
 	}
@@ -971,39 +846,11 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 			case SV_TESTED:
 				/* keep link if client expects more responses */
 				if (server->link) {
-					if (statlist_count(&server->outstanding_requests) > 0) {
-						PgSocket *client = server->link;
-						slog_debug(server, "EV_FLUSH: not releasing server db=%s (outstanding_requests=%d, waiting for server response)",
-							   server->pool->db->name, statlist_count(&server->outstanding_requests));
-						/*
-						 * Queued packets (e.g. Parse, Bind from prepare-before-bind) live in
-						 * the client's extra_packets and are sent when the client runs.
-						 * Trigger the client so it flushes those to the backend; then we
-						 * will get more server data (BindComplete, etc.) and EV_READ.
-						 */
-						slog_debug(server, "EV_FLUSH: sbuf_continue(client) to flush queued packets to backend (stall trace)");
-						sbuf_continue(&client->sbuf);
-						slog_debug(server, "EV_FLUSH: sbuf_continue(client) returned outstanding=%d (stall trace)",
-							   statlist_count(&server->outstanding_requests));
+					if (statlist_count(&server->outstanding_requests) > 0)
 						break;
-					}
-				}
-
-				/*
-				 * Do not release while the server's read buffer still has
-				 * unprocessed data; otherwise the next EV_READ will see
-				 * "not linked" and we drop responses (causing client errors
-				 * like "mismatched param and argument count").
-				 */
-				if (server->sbuf.pkt_remain > 0 ||
-				    (server->sbuf.io && iobuf_amount_parse(server->sbuf.io) > 0)) {
-					slog_debug(server, "EV_FLUSH: not releasing server db=%s (unprocessed data pkt_remain=%u)",
-						   server->pool->db->name, server->sbuf.pkt_remain);
-					break;
 				}
 
 				/* retval does not matter here */
-				slog_debug(server, "EV_FLUSH: calling release_server db=%s", server->pool->db->name);
 				release_server(server);
 				break;
 			default:

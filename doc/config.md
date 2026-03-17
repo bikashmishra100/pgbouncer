@@ -758,15 +758,6 @@ will be disconnected. Mainly needed to avoid dead connections stalling
 
 Default: 60.0
 
-### client_write_timeout
-
-If the server has response data ready for a client but the client socket
-remains unwritable (client not reading) for this long, the client connection
-is closed. This makes the server resilient to slow or stuck clients that would
-otherwise hold server state indefinitely. Set to 0 to disable. [seconds]
-
-Default: 0 (disabled)
-
 ### autodb_idle_timeout
 
 If the automatically created (via "*") database pools have

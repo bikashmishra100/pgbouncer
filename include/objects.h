@@ -51,7 +51,7 @@ PgSocket *compare_connections_by_time(PgSocket *lhs, PgSocket *rhs);
 bool evict_connection(PgDatabase *db)           _MUSTCHECK;
 bool evict_pool_connection(PgPool *pool)        _MUSTCHECK;
 bool evict_user_connection(PgCredentials *user_credentials)        _MUSTCHECK;
-bool find_server(PgSocket *client, bool allow_pause) _MUSTCHECK;
+bool find_server(PgSocket *client)              _MUSTCHECK;
 bool life_over(PgSocket *server);
 bool release_server(PgSocket *server) /* _MUSTCHECK */;
 bool finish_client_login(PgSocket *client)      _MUSTCHECK;
@@ -69,7 +69,7 @@ PgCredentials * add_dynamic_credentials(PgDatabase *db, const char *name, const 
 PgCredentials * force_user_credentials(PgDatabase *db, const char *username, const char *passwd) _MUSTCHECK;
 bool add_outstanding_request(PgSocket *client, char type, ResponseAction action) _MUSTCHECK;
 bool pop_outstanding_request(PgSocket *client, const char types[], bool *skip);
-bool clear_outstanding_requests_until(PgSocket *server, const char types[], bool unregister_parses) _MUSTCHECK;
+bool clear_outstanding_requests_until(PgSocket *server, const char types[]) _MUSTCHECK;
 bool queue_fake_response(PgSocket *client, char request_type) _MUSTCHECK;
 
 PgGlobalUser * update_global_user_passwd(PgGlobalUser *user, const char *passwd) _MUSTCHECK;
