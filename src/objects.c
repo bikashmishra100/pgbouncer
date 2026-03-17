@@ -963,6 +963,16 @@ bool find_server(PgSocket *client)
 		slog_noise(client, "linking client to S-%p", server);
 		client->link = server;
 		server->link = client;
+		/* Do not clear server prepared statement cache when linking in transaction/
+		 * statement mode. The server was not reset on release (no server_reset_query
+		 * in that mode), so it still has the same prepared statements. If we clear
+		 * our cache here we send a duplicate Parse (prepare-before-bind), get 42P05,
+		 * and the server discards the following Bind; we then wait forever for
+		 * BindComplete. Keeping the cache in sync with the server avoids that. */
+		/* Count every server assignment so the stat reflects activity (short-lived connections often have only one assign).
+		 * When handling pgbouncer.database hint we count once in the hint path (client.c) instead. */
+		if (!client->in_set_pgbouncer_database)
+			server->pool->stats.connection_switch_count++;
 		server->pool->stats.server_assignment_count++;
 		change_server_state(server, SV_ACTIVE);
 		if (varchange) {

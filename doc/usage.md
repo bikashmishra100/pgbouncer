@@ -189,6 +189,13 @@ total_query_count
 total_server_assignment_count
 :   Total times a server was assigned to a client
 
+total_connection_switch_count
+:   Total number of server assignments (connection switches): incremented
+    every time a client is linked to a server.  With short-lived
+    connections (one query per connection) this matches the number of
+    queries; with long-lived connections it also counts re-assignments
+    (e.g. transaction pooling).
+
 total_received
 :   Total volume in bytes of network traffic received by **pgbouncer**.
 
@@ -230,6 +237,9 @@ avg_query_count
 avg_server_assignment_count
 :   Average number of times a server as assigned to a client per second in the
     last stat period.
+
+avg_connection_switch_count
+:   Average number of connection switches per second in the last stat period.
 
 avg_recv
 :   Average received (from clients) bytes per second.
@@ -898,6 +908,25 @@ Changes a configuration setting (see also **SHOW CONFIG**).  For example:
 (Note that this command is run on the PgBouncer admin console and sets
 PgBouncer settings.  A **SET** command run on another database will be
 passed to the PostgreSQL backend like any other SQL command.)
+
+#### Database routing hint: \`/* pgbouncer.database = dbname */\`
+
+A **comment hint** at the very start of the query switches the client's pool
+to that database for the connection.  The hint must be the **first comment**
+in the query: after optional leading whitespace, the first token must be this
+block comment.  For example:
+
+    /* pgbouncer.database = otherdb */ SELECT 1;
+    /* pgbouncer.database = db1 */ INSERT INTO table VALUES (...);
+
+The value may be an unquoted identifier, a single-quoted string, or a
+double-quoted identifier (same as in PostgreSQL).  The full query, including
+the hint, is forwarded to the backend; PostgreSQL treats the block comment
+as a comment and ignores it, so no stripping is done.
+
+This works for both simple Query and extended protocol (Parse).  It works
+in all pooling modes and does not require special handling for transactions
+or roundtrip ordering.
 
 ### Signals
 

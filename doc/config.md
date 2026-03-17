@@ -1235,6 +1235,12 @@ Such automatically created database entries are cleaned up
 if they stay idle longer than the time specified by the `autodb_idle_timeout`
 parameter.
 
+A client can switch to a different database for subsequent queries on the
+same connection by using a **query hint**: the first comment in the query
+must be `/* pgbouncer.database = dbname */` (see **pgbouncer(1)** usage
+for details).  The database name in the hint must match a key in this
+section (or the fallback "*" applies).
+
 ### dbname
 
 Destination database name.
