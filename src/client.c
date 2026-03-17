@@ -697,10 +697,12 @@ static bool reject_set_pgbouncer_database_in_tx(PgSocket *client, PktHdr *pkt, u
 }
 
 /*
- * After database switch: update stats, acquire server, tag dirty, add
+ * After database switch: update stats, acquire server, tag dirty, optionally add
  * outstanding request.  Call after do_switch_database and sbuf_prepare_skip.
+ * When add_outstanding is false, caller will add requests in the correct order
+ * (e.g. handle_parse_command_stripped adds Q then P so server response order matches).
  */
-static bool db_switch_after_switch(PgSocket *client, PktHdr *pkt, int pkt_type)
+static bool db_switch_after_switch(PgSocket *client, PktHdr *pkt, int pkt_type, bool add_outstanding)
 {
 	/* Count SET pgbouncer.database execution once (do_switch_database/find_server skip when this flag is set) */
 	client->pool->stats.connection_switch_count++;
@@ -719,7 +721,9 @@ static bool db_switch_after_switch(PgSocket *client, PktHdr *pkt, int pkt_type)
 	client->pool->stats.client_bytes += pkt->len;
 	client->link->ready = false;
 	client->link->idle_tx = false;
-	return add_outstanding_request(client, pkt_type, RA_FORWARD);
+	if (add_outstanding && !add_outstanding_request(client, pkt_type, RA_FORWARD))
+		return false;
+	return true;
 }
 
 /*
@@ -1720,6 +1724,8 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	PreparedStatementAction ps_action = PS_IGNORE;
 	PgClosePacket close_packet;
 
+	slog_debug(client, "client pkt type=%c link=%s (stall trace)",
+		   pkt_desc(pkt), client->link ? "yes" : "no");
 	switch (pkt->type) {
 	/* one-packet queries */
 	case PqMsg_Query: {
@@ -1772,7 +1778,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 				return false;
 			}
 			sbuf_prepare_skip(sbuf, pkt->len);
-			if (!db_switch_after_switch(client, pkt, PqMsg_Query)) {
+			if (!db_switch_after_switch(client, pkt, PqMsg_Query, true)) {
 				free(query_copy);
 				client->db_switch_skip_switch = false;
 				return false;
@@ -1867,7 +1873,10 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 				return false;
 			}
 			sbuf_prepare_skip(sbuf, pkt->len);
-			if (!db_switch_after_switch(client, pkt, PqMsg_Parse)) {
+			/* We always call handle_parse_command_stripped below (with query_tail or "");
+			 * it adds Q (reset) then P. Do not add P here or server response order (C,Z,1...)
+			 * would not match the queue (P first would get CommandComplete). */
+			if (!db_switch_after_switch(client, pkt, PqMsg_Parse, false)) {
 				client->db_switch_skip_switch = false;
 				return false;
 			}
@@ -2076,8 +2085,15 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		return admin_handle_client(client, pkt);
 
 	/* acquire server */
+	if (!client->link) {
+		slog_debug(client, "stall trace: handle_client_work need server pkt_type=%c db=%s",
+			   pkt_desc(pkt), client->pool->db->name);
+	}
 	if (!find_server(client, true))
 		return false;
+	if (client->link)
+		slog_debug(client, "stall trace: handle_client_work have server pkt_type=%c server_outstanding=%d",
+			   pkt_desc(pkt), statlist_count(&client->link->outstanding_requests));
 
 	client->pool->stats.client_bytes += pkt->len;
 
@@ -2086,6 +2102,8 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	client->link->idle_tx = false;
 
 	if (ps_action != PS_IGNORE) {
+		slog_debug(client, "stall trace: handle_client_work ps_action=%d pkt_type=%c",
+			   ps_action, pkt_desc(pkt));
 		/*
 		 * All the following handle_xxx_packet functions below insert packets
 		 * into the packet queue through the extra_packets field of SBuf. This

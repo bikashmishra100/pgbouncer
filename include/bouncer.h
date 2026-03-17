@@ -768,6 +768,8 @@ struct PgSocket {
 	PgClientPreparedStatement *client_prepared_statements;
 	/* server: prepared statements prepared on this server */
 	PgServerPreparedStatement *server_prepared_statements;
+	/* server: counter for unique prepared statement names on this connection */
+	uint32_t stmt_name_counter;
 
 	/* cb state during SBUF_EV_PKT_CALLBACK processing */
 	struct CallbackState {
@@ -842,6 +844,7 @@ extern usec_t cf_query_wait_timeout;
 extern usec_t cf_cancel_wait_timeout;
 extern usec_t cf_client_idle_timeout;
 extern usec_t cf_client_login_timeout;
+extern usec_t cf_client_write_timeout;
 extern usec_t cf_idle_transaction_timeout;
 extern usec_t cf_transaction_timeout;
 extern bool any_user_level_timeout_set;
