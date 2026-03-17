@@ -524,6 +524,196 @@ static bool check_if_need_ldap_authentication(PgSocket *client, const char *dbna
 }
 #endif
 
+/*
+ * Parse the pgbouncer.database hint as the first comment in the query.
+ * The hint must be a block comment of the form: pgbouncer.database = value
+ * (after optional leading whitespace, the first token must be that block comment).
+ * Do NOT use skip_comments_and_whitespace here (it would skip our comment).
+ * On match: write db name into dbname_buf (null-terminated) and return true.
+ * value may be unquoted identifier, single-quoted string, or double-quoted
+ * identifier.  dbname_buf size must be at least MAX_DBNAME.  No stripping;
+ * full query is forwarded unchanged.
+ */
+static bool parse_pgbouncer_database_hint(const char *query, char *dbname_buf, size_t dbname_size)
+{
+	const char *p = query;
+	const char *start;
+
+	/* Skip only leading whitespace; do not skip comments */
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	/* First token must be opening of our block comment */
+	if (p[0] != '/' || p[1] != '*')
+		return false;
+	p += 2;
+	/* Optional space inside comment */
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	/* pgbouncer.database */
+	if (pg_strncasecmp(p, "pgbouncer.database", 18) != 0)
+		return false;
+	p += 18;
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	if (*p != '=')
+		return false;
+	p++;
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	/* value: '...' or "..." or unquoted identifier */
+	if (*p == '\'') {
+		p++;
+		start = p;
+		for (; *p && *p != '\''; p += (p[0] == '\'' && p[1] == '\'') ? 2 : 1)
+			;
+		if (*p != '\'')
+			return false;
+		{
+			char *dst = dbname_buf;
+			const char *src = start;
+			while (src < p) {
+				if (src[0] == '\'' && src[1] == '\'') {
+					*dst++ = '\'';
+					src += 2;
+				} else {
+					*dst++ = *src++;
+				}
+				if ((size_t)(dst - dbname_buf) >= dbname_size)
+					return false;
+			}
+			*dst = '\0';
+		}
+		p++;
+	} else if (*p == '"') {
+		p++;
+		start = p;
+		for (; *p && *p != '"'; p += (p[0] == '"' && p[1] == '"') ? 2 : 1)
+			;
+		if (*p != '"')
+			return false;
+		{
+			char *dst = dbname_buf;
+			const char *src = start;
+			while (src < p) {
+				if (src[0] == '"' && src[1] == '"') {
+					*dst++ = '"';
+					src += 2;
+				} else {
+					*dst++ = *src++;
+				}
+				if ((size_t)(dst - dbname_buf) >= dbname_size)
+					return false;
+			}
+			*dst = '\0';
+		}
+		p++;
+	} else {
+		start = p;
+		while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_')
+			p++;
+		if ((size_t)(p - start) >= dbname_size)
+			return false;
+		memcpy(dbname_buf, start, p - start);
+		dbname_buf[p - start] = '\0';
+	}
+	/* Optional space then closing */
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	if (p[0] != '*' || p[1] != '/')
+		return false;
+	return true;
+}
+
+/*
+ * Switch the client's connection to a different database. The current server
+ * link (if any) is released back to the pool. Next query will use the new pool.
+ * Does not send any response to the client (caller runs the query or sends reply).
+ */
+static bool do_switch_database(PgSocket *client, const char *newdbname)
+{
+	PgDatabase *old_db = client->db;
+	PgDatabase *new_db;
+	PgPool *new_pool;
+	PgCredentials *pool_user_credentials;
+
+	if (old_db->admin) {
+		send_pooler_error(client, true, "0A000", false,
+				  "cannot switch database from admin console");
+		return false;
+	}
+
+	new_db = find_or_register_database(client, newdbname);
+	if (!new_db) {
+		new_db = calloc(1, sizeof(*new_db));
+		if (!new_db) {
+			send_pooler_error(client, true, NULL, false, "out of memory");
+			return false;
+		}
+		new_db->fake = true;
+		strlcpy(new_db->name, newdbname, sizeof(new_db->name));
+	}
+	if (new_db->fake) {
+		send_pooler_error(client, true, "3D000", false, "database does not exist");
+		if (new_db != find_database(newdbname))
+			free(new_db);
+		return false;
+	}
+	if (new_db->admin) {
+		send_pooler_error(client, true, "0A000", false,
+				  "cannot switch to admin database");
+		return false;
+	}
+	if (new_db->db_disabled) {
+		send_pooler_error(client, true, "0A000", false, "database is disabled");
+		return false;
+	}
+
+	/* Same database: keep current server link, no release needed */
+	if (new_db == old_db)
+		return true;
+
+	if (client->link) {
+		PgSocket *server = client->link;
+		if (statlist_count(&server->outstanding_requests) > 0) {
+			send_pooler_error(client, true, "0A000", false,
+					  "cannot switch database with query in progress");
+			return false;
+		}
+		if (!server->ready || !sbuf_is_empty(&server->sbuf)) {
+			send_pooler_error(client, true, "0A000", false,
+					  "cannot switch database while server is busy");
+			return false;
+		}
+		release_server(server);
+		/* release_server unlinks client and server */
+	}
+
+	if (new_db != old_db) {
+		if (database_max_client_connections(new_db) > 0 &&
+		    new_db->client_connection_count >= database_max_client_connections(new_db)) {
+			send_pooler_error(client, true, "53300", false,
+					  "client connections exceeded (max_db_client_connections)");
+			return false;
+		}
+		pool_user_credentials = new_db->forced_user_credentials
+					? new_db->forced_user_credentials
+					: client->login_user_credentials;
+		new_pool = get_pool(new_db, pool_user_credentials);
+		if (!new_pool) {
+			send_pooler_error(client, true, NULL, false, "out of memory");
+			return false;
+		}
+		old_db->client_connection_count--;
+		client->db = new_db;
+		client->pool = new_pool;
+		new_db->client_connection_count++;
+		if (!client->in_set_pgbouncer_database)
+			new_pool->stats.connection_switch_count++;
+	}
+
+	return true;
+}
+
 bool set_pool(PgSocket *client, const char *dbname, const char *username, const char *password, bool takeover)
 {
 	Assert((password && takeover) || (!password && !takeover));
@@ -1436,14 +1626,41 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 
 	switch (pkt->type) {
 	/* one-packet queries */
-	case PqMsg_Query:
+	case PqMsg_Query: {
+		const char *query = NULL;
+		unsigned saved_pos;
+		char dbname_buf[MAX_DBNAME];
+
 		if (cf_disable_pqexec) {
 			slog_error(client, "client used \"Query\" packet type");
 			disconnect_client(client, true, "PQexec disallowed");
 			return false;
 		}
+		saved_pos = pkt->data.read_pos;
+		if (mbuf_get_string(&pkt->data, &query) &&
+		    parse_pgbouncer_database_hint(query, dbname_buf, sizeof(dbname_buf))) {
+			if (incomplete_pkt(pkt))
+				return false;
+			pkt->data.read_pos = saved_pos;
+			client->in_set_pgbouncer_database = true;
+			if (!do_switch_database(client, dbname_buf)) {
+				client->in_set_pgbouncer_database = false;
+				sbuf_prepare_skip(sbuf, pkt->len);
+				return true;
+			}
+			if (!find_server(client)) {
+				client->in_set_pgbouncer_database = false;
+				return false;
+			}
+			client->pool->stats.connection_switch_count++;
+			client->in_set_pgbouncer_database = false;
+			track_outstanding = true;
+			break;
+		}
+		pkt->data.read_pos = saved_pos;
 		track_outstanding = true;
 		break;
+	}
 	case PqMsg_FunctionCall:
 		track_outstanding = true;
 		break;
@@ -1465,13 +1682,40 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	 * extended protocol allows server (and thus pooler)
 	 * to buffer packets until sync or flush is sent by client
 	 */
-	case PqMsg_Parse:
+	case PqMsg_Parse: {
+		const char *statement = NULL;
+		const char *query = NULL;
+		unsigned saved_pos = pkt->data.read_pos;
+		char dbname_buf[MAX_DBNAME];
+
+		if (mbuf_get_string(&pkt->data, &statement) &&
+		    mbuf_get_string(&pkt->data, &query) &&
+		    parse_pgbouncer_database_hint(query, dbname_buf, sizeof(dbname_buf))) {
+			if (incomplete_pkt(pkt))
+				return false;
+			pkt->data.read_pos = saved_pos;
+			client->in_set_pgbouncer_database = true;
+			if (!do_switch_database(client, dbname_buf)) {
+				client->in_set_pgbouncer_database = false;
+				sbuf_prepare_skip(sbuf, pkt->len);
+				return true;
+			}
+			if (!find_server(client)) {
+				client->in_set_pgbouncer_database = false;
+				return false;
+			}
+			client->pool->stats.connection_switch_count++;
+			client->in_set_pgbouncer_database = false;
+			/* fall through: rewind, inspect_parse_packet, then common path; hint is stripped from query sent to server */
+		}
+		pkt->data.read_pos = saved_pos;
 		track_outstanding = true;
 		if (is_prepared_statements_enabled(client)) {
 			ps_action = inspect_parse_packet(client, pkt);
 			pkt_rewind_v3(pkt);
 		}
 		break;
+	}
 
 	case PqMsg_Execute:
 		track_outstanding = true;
@@ -1608,7 +1852,6 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	/* acquire server */
 	if (!find_server(client))
 		return false;
-
 	client->pool->stats.client_bytes += pkt->len;
 
 	/* tag the server as dirty */

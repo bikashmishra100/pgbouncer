@@ -26,6 +26,7 @@ static void reset_stats(PgStats *stat)
 	stat->server_bytes = 0;
 	stat->client_bytes = 0;
 	stat->server_assignment_count = 0;
+	stat->connection_switch_count = 0;
 	stat->query_count = 0;
 	stat->query_time = 0;
 	stat->xact_count = 0;
@@ -42,6 +43,7 @@ static void stat_add(PgStats *total, PgStats *stat)
 	total->server_bytes += stat->server_bytes;
 	total->client_bytes += stat->client_bytes;
 	total->server_assignment_count += stat->server_assignment_count;
+	total->connection_switch_count += stat->connection_switch_count;
 	total->query_count += stat->query_count;
 	total->query_time += stat->query_time;
 	total->xact_count += stat->xact_count;
@@ -56,6 +58,7 @@ static void stat_add(PgStats *total, PgStats *stat)
 static void calc_average(PgStats *avg, PgStats *cur, PgStats *old)
 {
 	uint64_t server_assignment_count;
+	uint64_t connection_switch_count;
 	uint64_t query_count;
 	uint64_t xact_count;
 	uint64_t ps_client_parse_count;
@@ -72,10 +75,12 @@ static void calc_average(PgStats *avg, PgStats *cur, PgStats *old)
 	query_count = cur->query_count - old->query_count;
 	xact_count = cur->xact_count - old->xact_count;
 	server_assignment_count = cur->server_assignment_count - old->server_assignment_count;
+	connection_switch_count = cur->connection_switch_count - old->connection_switch_count;
 
 	avg->query_count = USEC * query_count / dur;
 	avg->xact_count = USEC * xact_count / dur;
 	avg->server_assignment_count = USEC * server_assignment_count / dur;
+	avg->connection_switch_count = USEC * connection_switch_count / dur;
 
 	avg->client_bytes = USEC * (cur->client_bytes - old->client_bytes) / dur;
 	avg->server_bytes = USEC * (cur->server_bytes - old->server_bytes) / dur;
@@ -102,14 +107,16 @@ static void write_stats(PktBuf *buf, PgStats *stat, PgStats *old, char *dbname)
 {
 	PgStats avg;
 	calc_average(&avg, stat, old);
-	pktbuf_write_DataRow(buf, "sNNNNNNNNNNNNNNNNNNNNNN", dbname,
+	pktbuf_write_DataRow(buf, "sNNNNNNNNNNNNNNNNNNNNNNNN", dbname,
 			     stat->server_assignment_count,
+			     stat->connection_switch_count,
 			     stat->xact_count, stat->query_count,
 			     stat->client_bytes, stat->server_bytes,
 			     stat->xact_time, stat->query_time,
 			     stat->wait_time, stat->ps_client_parse_count,
 			     stat->ps_server_parse_count, stat->ps_bind_count,
 			     avg.server_assignment_count,
+			     avg.connection_switch_count,
 			     avg.xact_count, avg.query_count,
 			     avg.client_bytes, avg.server_bytes,
 			     avg.xact_time, avg.query_time,
@@ -134,14 +141,16 @@ bool admin_database_stats(PgSocket *client, struct StatList *pool_list)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "sNNNNNNNNNNNNNNNNNNNNNN", "database",
+	pktbuf_write_RowDescription(buf, "sNNNNNNNNNNNNNNNNNNNNNNNN", "database",
 				    "total_server_assignment_count",
+				    "total_connection_switch_count",
 				    "total_xact_count", "total_query_count",
 				    "total_received", "total_sent",
 				    "total_xact_time", "total_query_time",
 				    "total_wait_time", "total_client_parse_count",
 				    "total_server_parse_count", "total_bind_count",
 				    "avg_server_assignment_count",
+				    "avg_connection_switch_count",
 				    "avg_xact_count", "avg_query_count",
 				    "avg_recv", "avg_sent",
 				    "avg_xact_time", "avg_query_time",
@@ -174,8 +183,9 @@ bool admin_database_stats(PgSocket *client, struct StatList *pool_list)
 
 static void write_stats_totals(PktBuf *buf, PgStats *stat, PgStats *old, char *dbname)
 {
-	pktbuf_write_DataRow(buf, "sNNNNNNNNNNN", dbname,
+	pktbuf_write_DataRow(buf, "sNNNNNNNNNNNN", dbname,
 			     stat->server_assignment_count,
+			     stat->connection_switch_count,
 			     stat->xact_count, stat->query_count,
 			     stat->client_bytes, stat->server_bytes,
 			     stat->xact_time, stat->query_time,
@@ -200,8 +210,9 @@ bool admin_database_stats_totals(PgSocket *client, struct StatList *pool_list)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "sNNNNNNNNNNN", "database",
+	pktbuf_write_RowDescription(buf, "sNNNNNNNNNNNN", "database",
 				    "server_assignment_count",
+				    "connection_switch_count",
 				    "xact_count", "query_count",
 				    "bytes_received", "bytes_sent",
 				    "xact_time", "query_time",
@@ -236,8 +247,9 @@ static void write_stats_averages(PktBuf *buf, PgStats *stat, PgStats *old, char 
 {
 	PgStats avg;
 	calc_average(&avg, stat, old);
-	pktbuf_write_DataRow(buf, "sNNNNNNNNNNN", dbname,
+	pktbuf_write_DataRow(buf, "sNNNNNNNNNNNN", dbname,
 			     avg.server_assignment_count,
+			     avg.connection_switch_count,
 			     avg.xact_count, avg.query_count,
 			     avg.client_bytes, avg.server_bytes,
 			     avg.xact_time, avg.query_time,
@@ -262,8 +274,9 @@ bool admin_database_stats_averages(PgSocket *client, struct StatList *pool_list)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "sNNNNNNNNNNN", "database",
+	pktbuf_write_RowDescription(buf, "sNNNNNNNNNNNN", "database",
 				    "server_assignment_count",
+				    "connection_switch_count",
 				    "xact_count", "query_count",
 				    "bytes_received", "bytes_sent",
 				    "xact_time", "query_time",
@@ -325,6 +338,7 @@ bool show_stat_totals(PgSocket *client, struct StatList *pool_list)
 #define WAVG(name) pktbuf_write_DataRow(buf, "sN", "avg_" #name, avg.name)
 
 	WTOTAL(server_assignment_count);
+	WTOTAL(connection_switch_count);
 	WTOTAL(xact_count);
 	WTOTAL(query_count);
 	WTOTAL(client_bytes);
@@ -336,6 +350,7 @@ bool show_stat_totals(PgSocket *client, struct StatList *pool_list)
 	WTOTAL(ps_server_parse_count);
 	WTOTAL(ps_bind_count);
 	WAVG(server_assignment_count);
+	WAVG(connection_switch_count);
 	WAVG(xact_count);
 	WAVG(query_count);
 	WAVG(client_bytes);
@@ -357,6 +372,11 @@ static void refresh_stats(evutil_socket_t s, short flags, void *arg)
 	PgPool *pool;
 	PgStats old_total, cur_total;
 	PgStats avg;
+	usec_t dur;
+	double dur_sec;
+	double xact_rate, query_rate, switch_rate;
+	double client_parse_rate, server_parse_rate, bind_rate;
+	double in_rate, out_rate;
 
 	reset_stats(&old_total);
 	reset_stats(&cur_total);
@@ -377,46 +397,52 @@ static void refresh_stats(evutil_socket_t s, short flags, void *arg)
 
 	calc_average(&avg, &cur_total, &old_total);
 
+	/* Compute rates in floating point for accurate log output */
+	dur = new_stamp - old_stamp;
+	dur_sec = dur > 0 ? (double)dur / (double)USEC : 1.0;
+	xact_rate = (double)(cur_total.xact_count - old_total.xact_count) / dur_sec;
+	query_rate = (double)(cur_total.query_count - old_total.query_count) / dur_sec;
+	switch_rate = (double)(cur_total.connection_switch_count - old_total.connection_switch_count) / dur_sec;
+	client_parse_rate = (double)(cur_total.ps_client_parse_count - old_total.ps_client_parse_count) / dur_sec;
+	server_parse_rate = (double)(cur_total.ps_server_parse_count - old_total.ps_server_parse_count) / dur_sec;
+	bind_rate = (double)(cur_total.ps_bind_count - old_total.ps_bind_count) / dur_sec;
+	in_rate = (double)(cur_total.client_bytes - old_total.client_bytes) / dur_sec;
+	out_rate = (double)(cur_total.server_bytes - old_total.server_bytes) / dur_sec;
+
 	if (cf_log_stats) {
-		log_info("stats: %" PRIu64 " xacts/s,"
-			 " %" PRIu64 " queries/s,"
-			 " %" PRIu64 " client parses/s,"
-			 " %" PRIu64 " server parses/s,"
-			 " %" PRIu64 " binds/s,"
-			 " in %" PRIu64 " B/s,"
-			 " out %" PRIu64 " B/s,"
+		log_info("stats: %.2f xacts/s,"
+			 " %.2f queries/s,"
+			 " %.2f connection switches/s,"
+			 " %.2f client parses/s,"
+			 " %.2f server parses/s,"
+			 " %.2f binds/s,"
+			 " in %.0f B/s,"
+			 " out %.0f B/s,"
 			 " xact %" PRIu64 " us,"
 			 " query %" PRIu64 " us,"
 			 " wait %" PRIu64 " us",
-			 avg.xact_count,
-			 avg.query_count,
-			 avg.ps_client_parse_count,
-			 avg.ps_server_parse_count,
-			 avg.ps_bind_count,
-			 avg.client_bytes, avg.server_bytes,
-			 avg.xact_time, avg.query_time,
-			 avg.wait_time);
+			 xact_rate, query_rate, switch_rate,
+			 client_parse_rate, server_parse_rate, bind_rate,
+			 in_rate, out_rate,
+			 avg.xact_time, avg.query_time, avg.wait_time);
 	}
 
 	sd_notifyf(0,
-		   "STATUS=stats: %" PRIu64 " xacts/s,"
-		   " %" PRIu64 " queries/s,"
-		   " %" PRIu64 " client parses/s,"
-		   " %" PRIu64 " server parses/s,"
-		   " %" PRIu64 " binds/s,"
-		   " in %" PRIu64 " B/s,"
-		   " out %" PRIu64 " B/s,"
+		   "STATUS=stats: %.2f xacts/s,"
+		   " %.2f queries/s,"
+		   " %.2f connection switches/s,"
+		   " %.2f client parses/s,"
+		   " %.2f server parses/s,"
+		   " %.2f binds/s,"
+		   " in %.0f B/s,"
+		   " out %.0f B/s,"
 		   " xact %" PRIu64 " μs,"
 		   " query %" PRIu64 " μs,"
 		   " wait %" PRIu64 " μs",
-		   avg.xact_count,
-		   avg.query_count,
-		   avg.ps_client_parse_count,
-		   avg.ps_server_parse_count,
-		   avg.ps_bind_count,
-		   avg.client_bytes, avg.server_bytes,
-		   avg.xact_time, avg.query_time,
-		   avg.wait_time);
+		   xact_rate, query_rate, switch_rate,
+		   client_parse_rate, server_parse_rate, bind_rate,
+		   in_rate, out_rate,
+		   avg.xact_time, avg.query_time, avg.wait_time);
 }
 
 void stats_setup(void)

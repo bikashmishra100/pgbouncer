@@ -1,0 +1,33 @@
+# Run PgBouncer against a local PostgreSQL on the host (no Postgres container).
+# Usage (from repo root): docker compose -f debian-12/docker-compose.local.yml up --build
+#
+# Requires: local Postgres (db=postgres, user=default, password=strongpassword).
+# Exposes two databases: postgres1 and postgres2 (both point to the same backend).
+# Connect: psql -h localhost -p 6432 -U default -d postgres1   or  -d postgres2
+
+services:
+  pgbouncer:
+    build:
+      context: ..
+      dockerfile: debian-12/Dockerfile
+    ports:
+      - 6432:6432
+    environment:
+      # Backend: host Postgres (use host.docker.internal to reach host from container)
+      - POSTGRESQL_HOST=host.docker.internal
+      - POSTGRESQL_PORT=5432
+      - POSTGRESQL_USERNAME=default
+      - POSTGRESQL_PASSWORD=strongpassword
+      - POSTGRESQL_DATABASE=postgres
+      # First database entry name
+      - PGBOUNCER_DATABASE=postgres1
+      # Include user/password in connection string for backend auth
+      - PGBOUNCER_SET_DATABASE_USER=yes
+      - PGBOUNCER_SET_DATABASE_PASSWORD=yes
+      # Second database entry (same backend)
+      - PGBOUNCER_DSN_0=postgres2=host=host.docker.internal port=5432 dbname=postgres user=default password=strongpassword
+      # Client auth: plain so clients use user/password
+      - PGBOUNCER_AUTH_TYPE=plain
+    extra_hosts:
+      # Reach host from container (needed on Linux; harmless on Mac/Windows)
+      - "host.docker.internal:host-gateway"

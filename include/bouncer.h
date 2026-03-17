@@ -319,6 +319,7 @@ int pga_cmp_addr(const PgAddr *a, const PgAddr *b);
  */
 struct PgStats {
 	uint64_t server_assignment_count;
+	uint64_t connection_switch_count;
 	uint64_t xact_count;
 	uint64_t query_count;
 	uint64_t server_bytes;
@@ -664,6 +665,7 @@ struct PgSocket {
 	struct List head;		/* list header for pool list */
 	struct List cancel_head;	/* list header for server->canceling_clients */
 	PgSocket *link;		/* the dest of packets */
+	bool in_set_pgbouncer_database : 1;	/* client: handling pgbouncer.database hint; count connection_switch once in hint path only */
 	PgPool *pool;		/* parent pool, if NULL not yet assigned */
 
 	PgCredentials *login_user_credentials;	/* presented login, for client it may differ from pool->user */
